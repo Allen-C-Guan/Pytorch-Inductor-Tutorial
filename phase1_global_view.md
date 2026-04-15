@@ -7,12 +7,12 @@
 > - TorchInductor 设计帖: [dev-discuss.pytorch.org/t/torchinductor](https://dev-discuss.pytorch.org/t/torchinductor-a-pytorch-native-compiler-with-define-by-run-ir-and-symbolic-shapes/747)
 >
 > **源码版本**：基于 `main` 分支（2026-04 截取），核心文件行号以实际代码为准。
+>
+> **系列导航**：[全景总览](inductor_overview.md) | **阶段一** | [阶段二：FX 优化 →](phase2_fx_optimization.md) | [阶段三：Lowering →](phase3_lowering.md) | [阶段四：调度与融合 →](phase4_scheduling_fusion.md) | [阶段五：代码生成 →](phase5_codegen.md)
 
 ---
 
-## 一、设计思想与设计哲学
-
-## 数据流加工全景（新增）
+## 一、数据流加工全景
 
 Inductor 的编译管线本质上是一个**数据加工流水线**，每一道工序都将输入数据加工成特定的形态，为下一道工序做好准备。以下是完整的数据流加工过程，每一步都严格遵循"原始材料 → 加工步骤 → 产品输出"的工业生产类比。
 
@@ -199,9 +199,9 @@ def inner_fn_buf0(index):
 
 ---
 
-## 二、编译管线主体流程梳理
+## 三、编译管线主体流程梳理
 
-### 2.1 全景数据流与数据加工过程
+### 3.1 全景数据流与数据加工过程
 
 ```
 用户 Python 代码
@@ -292,7 +292,7 @@ AOTAutograd                      ── 用 fake tensor 运行 eager autograd，
     │  最终产品：性能提升 1.91x（推理）/ 1.45x（训练），保持完全兼容
 ```
 
-### 2.2 主体核心调用栈
+### 3.2 主体核心调用栈
 
 以下是从入口到产物的完整调用栈，标注了源码位置和关键行号：
 
@@ -353,7 +353,7 @@ compile_fx.py:787  compile_fx_inner(gm, example_inputs, ...)
 
 ---
 
-## 三、架构设计
+## 四、架构设计
 
 ### 3.1 分层架构 UML
 
@@ -555,7 +555,7 @@ codegen/common.py:400  register_backend_for_device()
 
 ---
 
-## 四、关键源码讲解
+## 五、关键源码讲解
 
 ### 4.1 编译入口：compile_fx_inner
 
@@ -1027,7 +1027,7 @@ class CompiledFxGraph(OutputCode):
 
 ---
 
-## 五、核心技术
+## 六、核心技术
 
 ### 5.1 延迟求值（Lazy Evaluation）与数据流加工
 
@@ -1227,7 +1227,7 @@ def kernel(in_ptr0, out_ptr0, xnumel, XBLOCK : tl.constexpr):
 
 ---
 
-## 六、自主学习 Debug 路线
+## 七、自主学习 Debug 路线
 
 以下路线设计为**可独立执行**的实验序列。每一步都有明确的输入、输出和关注点。
 
@@ -1493,7 +1493,7 @@ print(f"Match: {torch.allclose(eager_result, compiled_result, atol=1e-5)}")
 
 ---
 
-## 七、全局观检验清单
+## 八、全局观检验清单
 
 完成以上 8 步 debug 路线后，你应当能够回答以下问题。如果都能回答，说明全局观已建立：
 
@@ -1575,7 +1575,7 @@ print(f"Match: {torch.allclose(eager_result, compiled_result, atol=1e-5)}")
 
 ---
 
-## 八、数据流加工总结（新增）
+## 九、数据流加工总结
 
 ### 完整的数据加工流水线
 

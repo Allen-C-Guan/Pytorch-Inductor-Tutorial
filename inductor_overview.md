@@ -709,32 +709,39 @@ def log2(x):
 
 ## 五、推荐学习路径
 
-### 阶段一：建立全局观（1-2 天）
+以下路径与 [phase1_global_view.md](phase1_global_view.md) → [phase5_codegen.md](phase5_codegen.md) 系列教程一一对应。每份教程文档都包含设计哲学、调用栈、UML 图、数据流加工、Debug 路线、交叉校验等完整教学结构。
+
+### 阶段一：建立全局观（1-2 天）→ [phase1_global_view.md](phase1_global_view.md)
 1. `compile_fx.py` → `compile_fx_inner()` 走一遍主流程
 2. 搭配 `config.py` 了解可配置项
+3. **教程重点**：设计哲学（Define-by-Run IR）、延迟求值、V.ops 虚拟化、8 步 Debug 路线
 
-### 阶段二：理解 FX 优化（2-3 天）
+### 阶段二：理解 FX 优化（2-3 天）→ [phase2_fx_optimization.md](phase2_fx_optimization.md)
 1. `pattern_matcher.py` → 模式匹配引擎
 2. `fx_passes/pre_grad.py` → 理解 Pass 注册机制
 3. 选 1-2 个具体 Pass 深入（推荐 `fuse_attention.py` 或 `efficient_conv_bn_eval.py`）
+4. **教程重点**：三阶段 Pass 体系、模式匹配 DAG 构建、Attention 融合、Conv-BN 折叠
 
-### 阶段三：理解 Lowering（3-5 天）
+### 阶段三：理解 Lowering（3-5 天）→ [phase3_lowering.md](phase3_lowering.md)
 1. `graph.py` → `GraphLowering.run_node()` 和 `call_function()`
 2. `lowering.py` → 从简单算子（add, mul）到复杂算子（mm, convolution）
 3. `ir.py` → 重点理解 `TensorBox`、`Buffer`、`Layout` 类层次
 4. `virtualized.py` → 理解 `V.ops` 机制
+5. **教程重点**：make_pointwise 闭包构造、Inlining 机制、FlexibleLayout vs FixedLayout、Reduction 多层优化
 
-### 阶段四：理解调度与融合（3-5 天）
+### 阶段四：理解调度与融合（3-5 天）→ [phase4_scheduling_fusion.md](phase4_scheduling_fusion.md)
 1. `scheduler.py` → `Scheduler.run()` 主流程
 2. `dependencies.py` → 依赖分析
 3. `memory.py` → 内存规划
+4. **教程重点**：贪心融合算法（can_fuse + score_fusion）、三类依赖（MemoryDep/StarDep/WeakDep）、水平/垂直/Template 融合、内存优化排序
 
-### 阶段五：理解代码生成（5-7 天）
+### 阶段五：理解代码生成（5-7 天）→ [phase5_codegen.md](phase5_codegen.md)
 1. `codegen/common.py` → 后端注册框架
 2. `codegen/triton.py` → Triton kernel 生成（GPU 路径）
 3. `codegen/cpp.py` → C++ kernel 生成（CPU 路径）
 4. `codegen/wrapper.py` → Python wrapper 生成
 5. `output_code.py` → 编译产物封装
+6. **教程重点**：CSE 消除、TritonKernel.load/store/indexing、CppVecKernel 向量化、OpenMP 并行、MemoryPlanner 池化、CompiledFxGraph 封装
 
 ### 阶段六：高级主题（按需）
 - Autotuning: `select_algorithm.py` + `autotune_process.py`
