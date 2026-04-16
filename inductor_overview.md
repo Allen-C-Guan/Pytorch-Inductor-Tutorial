@@ -473,13 +473,13 @@ IRNode (基类)
 
 ## 四、关键机制深入
 
-### 4.1 Define-by-Run IR：一个完整示例
+### 4.1 Define-by-Run IR：核心理念
 
-论文 Figure 2 展示了 `torch.log2` 在 2D 张量上的 Inductor IR。这是理解整个系统的最佳起点：
+Inductor IR 最大的创新是 **Define-by-Run**（边执行边定义）。与 TensorFlow 的 Static Graph 不同，Inductor 的 IR 在 Python 解释器中**逐步构建**，每执行一个算子就立即生成对应的 IR 节点。这使得 IR 构建过程可以利用 Python 的全部控制流能力。
+
+**核心示例**（`torch.log2(x)` 的 Inductor IR，论文 Figure 2）：
 
 ```python
-# torch.log2(x) 的 Inductor IR（论文 Figure 2）
-
 def inner_fn_buf0(index):
     i0, i1 = index
     tmp0 = ops.load("arg0_1", i0 * s1 + i1)      # 从输入 buffer 加载
@@ -487,21 +487,9 @@ def inner_fn_buf0(index):
     tmp2 = ops.constant(1.4426950408889634, torch.float32)  # 1/ln(2)
     tmp3 = ops.mul(tmp1, tmp2)                      # log(x) * (1/ln(2)) = log2(x)
     return tmp3
-
-buf0_ir = TensorBox(
-    StorageBox(
-        ComputedBuffer(
-            name='buf0',
-            layout=FixedLayout('cuda', torch.float32,
-                               size=[s0, s1], stride=[s1, 1]),
-            data=Pointwise(
-                inner_fn=inner_fn_buf0,
-                ranges=[s0, s1],
-            )
-        )
-    )
-)
 ```
+
+> 完整的 IR 结构（TensorBox/StorageBox/ComputedBuffer 包装）和 V.ops 虚拟化机制的深入讲解，见 [阶段一 6.1-6.2 节](phase1_global_view.md)。
 
 **关键观察**：
 - `inner_fn_buf0` 是一个普通 Python 函数——这就是 "define-by-run" 的含义。IR 就是用可执行的 Python 代码来定义循环体
@@ -573,91 +561,54 @@ register_backend_for_device("cpu", CppScheduling, PythonWrapperCodegen)
 
 调度器根据张量的设备类型自动选择对应后端的 Scheduling 和 Kernel 类。
 
-### 4.4 Autotuning 流程
+### 4.6 Autotuning 流程
 
 1. `lowering.py` 中为 GEMM/Conv 等操作注册多个候选实现
 2. `select_algorithm.py` 为每个候选创建 benchmark request
 3. `autotune_process.py` 在子进程中运行 benchmark
 4. 最快的实现被选中，结果缓存到 `autotune_cache`
 
-### 4.6 Inlining vs Fusion：两个不同的优化阶段
+### 4.7 Inlining vs Fusion：两个不同的优化阶段
 
 论文 Table 4 的消融实验揭示了一个关键区分：kernel 组合发生在**两个不同阶段**。
 
 **Inlining（内联）**——发生在 **Lowering 阶段**（`graph.py` / `lowering.py`）：
 - 当阈值满足时，将 pointwise kernel 的函数体**复制**到所有消费者中
 - 避免中间结果的物化（realize），让多个操作在同一个函数闭包内执行
-- 这就是为什么 `inner_fn_buf0` 会包含从 load 到 mul 的整个链——它由多个小闭包内联组合而成
 
 **Fusion（融合）**——发生在 **Scheduling 阶段**（`scheduler.py`）：
 - 将剩余的独立 kernel 组合为单个 kernel
-- 支持水平融合（consumer-consumer fusion）
 - 通过 `can_fuse()` 和 `score_fusion()` 两个关键函数控制
 
 **两者关系**（论文原话）：
 > "The biggest speedups in TorchInductor come from combining pointwise, reduction, and scatter kernels together into a smaller number of fused kernels. Without both of those passes, TorchInductor generates slowdowns rather than speedups."
 
-**消融实验数据**（HuggingFace float16, A100 GPU）：
+关键结论：**fusion + inlining 是加速的最大来源**（去掉后推理从 1.91x 变为 0.80x，反而比 eager 模式更慢）。没有它们，分解（decomposition）将大的优化算子拆成了很多小算子，必须靠融合重新组合才能恢复性能。
 
-| 优化 | 推理加速 | 训练加速 | 移除后损失 |
-|------|---------|---------|-----------|
-| 全部优化 | 1.91x | 1.45x | — |
-| 去 fusion | 1.68x | 1.27x | -0.23 / -0.18 |
-| 去 inlining | 1.58x | 1.31x | -0.33 / -0.14 |
-| 去 fusion + inlining | 0.80x | 0.59x | **-1.11 / -0.86**（减速！） |
-| 去 matmul 模板 | 1.85x | 1.41x | -0.06 / -0.04 |
-| 去 cudagraphs | 1.81x | 1.37x | -0.10 / -0.08 |
-| 去 pattern matching | 1.83x | 1.45x | -0.08 / -0.00 |
+> 完整消融实验数据表和深入的因果分析，见 [阶段一 2.3 节](phase1_global_view.md) 和 [阶段四 1.2 节](phase4_scheduling_fusion.md)。
 
-关键结论：**fusion + inlining 是加速的最大来源**。没有它们，Inductor 反而会变慢，因为分解（decomposition）将大的优化算子拆成了很多小算子，必须靠融合重新组合才能恢复性能。
+### 4.8 融合算法概览
 
-### 4.7 融合算法详解
+论文 Section 4.4 描述了调度器的融合贪心算法。核心函数 `can_fuse()` 和 `score_fusion()` 控制融合的合法性和优先级，在最多 10 轮贪心循环中迭代融合直到收敛。
 
-论文 Section 4.4 描述了调度器的融合贪心算法：
+> 融合算法的详细源码讲解、UML 图和 Debug 路线，见 [阶段四：调度与融合](phase4_scheduling_fusion.md)。
 
-**两个核心函数**：
-- `Scheduler.can_fuse(node1, node2)` → 检查两个节点能否融合。检查依赖边、多种属性确保正确性。有启发式逻辑（如 `aggressive_fusion=False` 时阻止没有公共内存访问的融合）。有后端特定逻辑（如 Triton 支持 reduction-broadcast-reduction 融合但 C++ 不支持）
-- `Scheduler.score_fusion(node1, node2)` → 对融合机会评分排序。评分依据：1) 融合类别（pointwise/reduction/template）2) 估计节省的内存流量字节数 3) 原始图中的节点距离
+### 4.9 生成的 Triton 代码示例
 
-**贪心循环**（直到没有新的融合机会）：
-1. 找到所有融合机会
-2. 按 score 排序
-3. 对每个融合机会，检查是否仍然合法，如果合法则应用
-4. 两个节点融合后，更新所有指向原节点的待定融合机会
+论文 Figure 3 展示了 `torch.log2` 最终生成的 Triton kernel 代码。核心要点是 `@pointwise` 装饰器编码了 block size 启发式、autotuning 和 AOT 编译的样板代码，而 body 中的 `tl.load / tl.log / tl.store` 则直接对应 inner_fn 中的 `ops.load / ops.log / ops.store`。
 
-### 4.8 生成的 Triton 代码示例
-
-论文 Figure 3 展示了 `torch.log2` 最终生成的 Triton kernel：
-
-```python
-@pointwise(...)
-@triton.jit
-def kernel(in_ptr0, out_ptr0, xnumel, XBLOCK : tl.constexpr):
-    xoffset = tl.program_id(0) * XBLOCK
-    xindex = xoffset + tl.arange(0, XBLOCK)[:]
-    xmask = xindex < xnumel
-    x0 = xindex
-    tmp0 = tl.load(in_ptr0 + x0, xmask)    # 加载输入
-    tmp1 = tl.log(tmp0)                      # log
-    tmp2 = 1.4426950408889634                 # 1/ln(2)
-    tmp3 = tmp1 * tmp2                       # log2 = log * (1/ln(2))
-    tl.store(out_ptr0 + x0, tmp3, xmask)     # 存储输出
-```
-
-**代码生成要点**：
-- `@pointwise` 装饰器编码了 block size 启发式、autotuning、AOT kernel 编译的样板代码
-- 代码生成时进行了索引简化：2D strided load 被转换为 contiguous load（因为本例中是连续的）
+> 完整的 Triton 和 C++ 代码生成过程，见 [阶段五：代码生成](phase5_codegen.md)。
 - **CSE（公共子表达式消除）** 在打印代码行时通过缓存实现，中间变量命名为 `tmp0`, `tmp1`, ...
 - 对非整除 XBLOCK 的大小，末尾元素通过 mask 屏蔽
 
-### 4.9 Reduction 代码生成的两种模式
+### 4.10 Reduction 代码生成的两种模式
 
 论文 Section 4.5 描述了 reduction kernel 的两种代码生成策略：
 
 1. **Persistent Reduction**（小归约）：整个 reduction 维度在单个 block 内加载，数据保持在寄存器/共享内存中。直接映射到 Triton reduction 操作符
 2. **Loop-Based Reduction**（大归约）：使用整个 block 作为累加器，在循环中迭代，循环结束时调用一次 Triton reduction
 
-### 4.10 C++ 后端的两种变体
+### 4.11 C++ 后端的两种变体
 
 论文 Section 4.6 描述了 CPU 后端的两种代码生成变体：
 
@@ -666,7 +617,7 @@ def kernel(in_ptr0, out_ptr0, xnumel, XBLOCK : tl.constexpr):
 
 两种变体都使用 `#pragma omp for` 进行 OpenMP 并行化，有启发式逻辑决定并行化多少层循环。
 
-### 4.11 Wrapper 代码生成的两种变体
+### 4.12 Wrapper 代码生成的两种变体
 
 论文 Section 4.7 描述了 wrapper codegen 的两种实现：
 
@@ -675,7 +626,7 @@ def kernel(in_ptr0, out_ptr0, xnumel, XBLOCK : tl.constexpr):
 
 当启用 `mode="reduce-overhead"` 时，Inductor 使用 **CUDA Graphs** 在 CUDA driver 层面录制和重放 kernel launch，开销比 C++ wrapper 更低。CUDA Graphs 仅在安全条件满足时自动启用（动态形状、非 CUDA tensor 等情况下自动禁用）。
 
-### 4.12 算子分解（Decomposition）示例
+### 4.13 算子分解（Decomposition）示例
 
 论文 Section 4.2 给出了一个具体的分解示例：
 
@@ -691,7 +642,7 @@ def log2(x):
 
 **规模**：论文写作时，Inductor 使用了 **191 个分解**（387 含重载），**433 个 lowering**（1605 含重载）。未知算子自动转为 **fallback kernel** 运行原始 PyTorch 代码。
 
-### 4.13 动态形状（Dynamic Shapes）
+### 4.14 动态形状（Dynamic Shapes）
 
 论文 Section 5 专门讨论了动态形状支持——这是 Inductor 区别于许多其他编译器的核心能力：
 

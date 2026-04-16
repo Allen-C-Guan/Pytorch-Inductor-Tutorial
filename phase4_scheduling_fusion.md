@@ -7,7 +7,7 @@
 > - TorchInductor 设计帖: [dev-discuss.pytorch.org/t/torchinductor](https://dev-discuss.pytorch.org/t/torchinductor-a-pytorch-native-compiler-with-define-by-run-ir-and-symbolic-shapes/747)
 > - Inductor 文件结构讨论: [dev-discuss.pytorch.org/t/inductor-file-structure-explanation](https://dev-discuss.pytorch.org/t/inductor-file-structure-explanation/1860)
 >
-> **源码版本**：基于 `main` 分支（2026-04 截取），核心文件行号以实际代码为准。
+> **源码版本**：基于 `main` 分支截取（最近变更: commit `d63aab0`, 2026-04-07），行号可能随代码演进偏移，请以实际源码为准。
 >
 > **系列导航**：[全景总览](inductor_overview.md) | [← 阶段一：全局观](phase1_global_view.md) | [← 阶段二：FX 优化](phase2_fx_optimization.md) | [← 阶段三：Lowering](phase3_lowering.md) | **阶段四：调度与融合** | [阶段五：代码生成 →](phase5_codegen.md)
 
@@ -177,7 +177,7 @@ compile_fx.py:1473  GraphLowering(gm, example_inputs, ...)
 | `Scheduler(operations)` | scheduler.py:3084 | 将 IR 操作列表转换为调度图 |
 | `create_scheduler_node()` | scheduler.py:3103 | IR Operation → SchedulerNode 映射 |
 | `extract_read_writes()` | dependencies.py:659 | 通过 V.ops handler 分析内存依赖 |
-| `compute_dependencies()` | scheduler.py:3155 | 构建 SchedulerNode 间依赖边 |
+| `compute_dependencies()` | scheduler.py:3476（调用在 L3155） | 构建 SchedulerNode 间依赖边 |
 | `fuse_nodes()` | scheduler.py:4023 | 最多 10 轮贪心融合 |
 | `can_fuse()` | scheduler.py:5785 | 融合合法性检查（多阶段） |
 | `score_fusion_key()` | scheduler.py:6536 | 融合优先级评分 |
@@ -409,7 +409,7 @@ def codegen(self):
 | Extern | `codegen_extern_call()` | 外部库调用 |
 | Foreach | `backend.codegen_combo_kernel()` | 并行操作合并 |
 | MixOrder | `backend.codegen_mix_order_reduction()` | 混序归约 |
-| Fused/Scheduler | `backend.codegen_node()` | 标准 kernel 代码生成 |
+| Fused/Scheduler | `backend.codegen_node()` | 标准 kernel 代码生成（详见阶段五） |
 
 ---
 
@@ -443,7 +443,7 @@ BaseSchedulerNode (scheduler.py:539)
 │   ├── 临时分组，阻止外部融合
 │   └── temp_grouping 标记
 │
-└── FusedMixOrderReductions (scheduler.py:232)
+└── FusedMixOrderReductions (scheduler.py:2176)
     └── 融合不同循环顺序的 Reduction
 ```
 
@@ -1036,7 +1036,7 @@ ops.load("buf0", (M - 1 - d0) * N + d1)
 
 ### 7.3 死代码消除
 
-`dead_node_elimination()` (scheduler.py) 移除没有用户的节点：
+`dead_node_elimination()` (scheduler.py:3824) 移除没有用户的节点：
 
 1. 从输出节点开始反向标记可达节点
 2. 未被标记的节点被视为死代码
@@ -1074,12 +1074,12 @@ buf0 ──▶ [sigmoid] ──▶ buf2   （单次读 buf0，两个操作在同
 
 ### 7.6 内存规划：三层优化
 
-1. **调度层**：`reorder_for_peak_memory()` — 重排节点执行顺序
-2. **复用层**：`AllocateLine.should_reuse_buffer()` — 判断 freed buffer 是否可复用
+> **注意**：前两层（调度重排 + 复用判断）在 Scheduling 阶段完成，属于本阶段（Phase 4）。第三层池化优化在 Wrapper 代码生成阶段由 `MemoryPlanner` 完成（详见阶段五 6.4 节）。
+
+1. **调度层**（Phase 4）：`reorder_for_peak_memory()` — 重排节点执行顺序以降低峰值内存
+2. **复用层**（Phase 4）：`AllocateLine.should_reuse_buffer()` — 判断 freed buffer 是否可复用
    - 条件：设备、dtype、存储大小、对齐匹配，且不增加峰值内存
-3. **池化层**：`AllocationPool` — 多个 buffer 共享一块 `torch.empty()` 分配
-   - `TemporalSplit`：不同时间存活的可共享同一空间
-   - `SpatialSplit`：不同空间位置的可合并为连续分配
+3. **池化层**（Phase 5）：`AllocationPool` — 多个 buffer 共享一块 `torch.empty()` 分配（详见阶段五）
 
 ---
 

@@ -7,7 +7,7 @@
 > - TorchInductor 设计帖: [dev-discuss.pytorch.org/t/torchinductor](https://dev-discuss.pytorch.org/t/torchinductor-a-pytorch-native-compiler-with-define-by-run-ir-and-symbolic-shapes/747)
 > - PyTorch dev-discuss: [Inductor file structure explanation](https://dev-discuss.pytorch.org/t/inductor-file-structure-explanation/1860)
 >
-> **源码版本**：基于 `main` 分支（2026-04 截取），核心文件行号以实际代码为准。
+> **源码版本**：基于 `main` 分支截取（最近变更: commit `d63aab0`, 2026-04-07），行号可能随代码演进偏移，请以实际源码为准。
 >
 > **系列导航**：[全景总览](inductor_overview.md) | [← 阶段一：全局观](phase1_global_view.md) | [← 阶段二：FX 优化](phase2_fx_optimization.md) | **阶段三：Lowering** | [阶段四：调度与融合 →](phase4_scheduling_fusion.md) | [阶段五：代码生成 →](phase5_codegen.md)
 
@@ -753,8 +753,8 @@ def fallback_handler(kernel, add_to_fallback_set=True):
 
 **FallbackKernel**（ir.py）封装了对原始 ATen 算子的调用。在运行时，它直接调用 cuBLAS、cuDNN 等高度优化的库实现。
 
-**典型 fallback 算子**：
-- `aten.mm` / `aten.addmm` — 矩阵乘法（cuBLAS / Triton mm template）
+**典型外部 kernel 算子**：
+- `aten.mm` / `aten.addmm` — 矩阵乘法。在 GPU 上可能走 Triton mm template 或 cuBLAS，在 CPU 上走 oneDNN；当无专用 template 时才 fallback 到 `FallbackKernel`
 - `aten.convolution` — 卷积（cuDNN / oneDNN）
 - `aten.scaled_dot_product_attention` — SDPA（Flash Attention / Memory Efficient Attention）
 
@@ -921,6 +921,8 @@ def run_node(self, n):
 ### 6.3 StorageBox.realize() —— 延迟求值的物化
 
 **文件**：[ir.py:9443-9470](torch/_inductor/ir.py#L9443)
+
+> 以下为简化展示，实际实现中注册逻辑在 `ComputedBuffer` 构造过程中完成，行号仅作参考。
 
 ```python
 def realize(self) -> str | None:
@@ -1398,7 +1400,7 @@ result = mixed_ops(x, w)
 **关注点**（在 graph.py:1319 设断点）：
 - `x + 1.0`：target = `aten.add`，走 make_pointwise 路径
 - `b.sum(dim=-1)`：target = `aten.sum`，走 make_reduction 路径
-- `x @ w`：target = `aten.mm`，走 fallback 路径
+- `x @ w`：target = `aten.mm`，GPU 上可能走 Triton mm template，无专用 template 时走 fallback 路径
 - 每种路径返回的 IR 节点类型有何不同？
 
 **输入**：包含三种类型算子的模型
@@ -1701,7 +1703,7 @@ Fallback      TensorBox args             make_fallback(op)             TensorBox
 
 | 修正内容 | 修正原因 |
 |----------|----------|
-| mm/convolution 使用 fallback 机制（非自定义 lowering） | 源码确认 make_fallback(aten.addbmm) 等，mm 通过 fallback handler 实现 |
+| mm/convolution 使用外部 kernel 机制（GPU 上可能走专用 template，无 template 时 fallback） | 源码确认 make_fallback(aten.addbmm) 等，mm 在 GPU 上可通过 Triton mm template 或 cuBLAS 实现 |
 | Reduction.create() 包含多层优化（空/小/大归约路径） | 源码 ir.py:1541-1740 确认有四种优化路径 |
 | 分解表总量为 ~1145 个（core 1107 + random 38） | 源码分解：1001 core + 106 inductor-specific + 38 random ≈ 1145 |
 
@@ -1767,7 +1769,7 @@ Fallback      TensorBox args             make_fallback(op)             TensorBox
 - [ ] `TensorBox` → `StorageBox` → `Buffer` 的延迟求值链是什么？`realize()` 触发了什么？
 - [ ] `Pointwise.make_loader()` 如何实现 Inlining？返回的是什么？
 - [ ] `make_reduction()` 和 `make_pointwise()` 的关键区别是什么？为什么归约必须 realize？
-- [ ] `make_fallback()` 解决什么问题？为什么 mm/convolution 使用 fallback？
+- [ ] `make_fallback()` 解决什么问题？为什么有些算子使用 fallback，而 mm 在 GPU 上可走专用 template？
 - [ ] `FlexibleLayout` 和 `FixedLayout` 的区别是什么？布局在什么时候冻结？
 - [ ] `V.ops` 的虚拟化机制如何让同一个 inner_fn 在不同阶段有不同语义？
 - [ ] View 操作（expand/permute/reshape）如何在 IR 层面实现零拷贝？

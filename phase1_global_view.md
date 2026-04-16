@@ -6,7 +6,7 @@
 > - PyTorch 2 论文 (ASPLOS 2024): *"PyTorch 2: Faster Machine Learning Through Dynamic Python Bytecode Transformation and Graph Compilation"*
 > - TorchInductor 设计帖: [dev-discuss.pytorch.org/t/torchinductor](https://dev-discuss.pytorch.org/t/torchinductor-a-pytorch-native-compiler-with-define-by-run-ir-and-symbolic-shapes/747)
 >
-> **源码版本**：基于 `main` 分支（2026-04 截取），核心文件行号以实际代码为准。
+> **源码版本**：基于 `main` 分支截取（最近变更: commit `d63aab0`, 2026-04-07），行号可能随代码演进偏移，请以实际源码为准。
 >
 > **系列导航**：[全景总览](inductor_overview.md) | **阶段一** | [阶段二：FX 优化 →](phase2_fx_optimization.md) | [阶段三：Lowering →](phase3_lowering.md) | [阶段四：调度与融合 →](phase4_scheduling_fusion.md) | [阶段五：代码生成 →](phase5_codegen.md)
 
@@ -138,7 +138,7 @@ scheduler.codegen() + 后端处理
 
 ## 二、设计思想与设计哲学
 
-### 1.1 四项核心设计原则
+### 2.1 四项核心设计原则
 
 论文 Section 4.1 明确提出了 Inductor 的四项设计原则。这不是空洞的口号——每一项原则都深刻影响了代码结构和设计决策：
 
@@ -149,7 +149,7 @@ scheduler.codegen() + 后端处理
 | **Breadth First** | 早期就覆盖广泛的算子、硬件和优化，优先支持 training（比 inference 更难） | 433 个 lowering（1605 含重载）、191 个分解（387 含重载）、多后端支持（Triton/C++/CUTLASS/ROCm/MPS） |
 | **Reuse State-Of-The-Art Languages** | 不发明 kernel 语言，而是生成 **Triton**（GPU）和 **C++/OpenMP**（CPU）作为输出 | `codegen/triton.py` 生成 Triton kernel；`codegen/cpp.py` 生成 C++ kernel |
 
-### 1.2 核心设计理念：Define-by-Run IR
+### 2.2 核心设计理念：Define-by-Run IR
 
 这是理解 Inductor 的**最重要的概念**。
 
@@ -177,7 +177,7 @@ def inner_fn_buf0(index):
 
 这个设计理念是贯穿整个 Inductor 的"灵魂"——理解了它，你就理解了为什么 `virtualized.py` 如此核心，为什么 IR 操作通过 `V.ops` 分发，为什么代码生成看起来像"运行"一个函数而不是"遍历"一棵树。
 
-### 1.3 两阶段优化哲学：Inlining + Fusion
+### 2.3 两阶段优化哲学：Inlining + Fusion
 
 论文 Table 4 的消融实验揭示了一个深刻的设计决策：**性能提升的核心来源不是某个单独的优化，而是 Inlining 和 Fusion 的协同**。
 
@@ -191,7 +191,7 @@ def inner_fn_buf0(index):
 | 去 matmul 模板 | 1.85x (-0.06) | 1.41x (-0.04) |
 | 去参数冻结 | 1.85x (-0.06) | 1.45x (-0.00) |
 
-**为什么没有 inlining + fusion 反而会减速**？因为 Decomposition 阶段将大的优化算子（如 `log2` → `log * constant`）拆成了很多小算子。Inlining 和 Fusion 的作用就是**把这些碎片重新粘合**。没有它们，分解后的碎片每个都变成独立的 kernel launch，GPU 利用率骤降。
+**为什么没有 inlining + fusion 反而会减速**？因为 Decomposition 阶段将大的优化算子（如 `log2` → `log * constant`）拆成了很多小算子。Inlining 和 Fusion 的作用就是**把这些碎片重新粘合**。没有它们，分解后的碎片每个都变成独立的 kernel launch。以 `torch.log2` 为例：分解后产生 `log` 和 `mul` 两个独立算子，没有融合时需要 2 次 GPU kernel launch 和 1 次中间显存分配；而 eager 模式下 PyTorch 的 C++ 实现只需 1 次调用。对于更复杂的算子（如 `softmax`，分解后可能产生 5-6 个子算子），这种碎片化的影响更加严重——kernel launch 开销和中间显存分配远超 eager 模式的单次融合执行。
 
 **两阶段的分工**：
 - **Inlining**（Lowering 阶段，`graph.py`）：将 pointwise kernel 的函数体**复制**到消费者中，避免中间结果物化
@@ -355,7 +355,7 @@ compile_fx.py:787  compile_fx_inner(gm, example_inputs, ...)
 
 ## 四、架构设计
 
-### 3.1 分层架构 UML
+### 4.1 分层架构 UML
 
 ```mermaid
 graph TB
@@ -421,7 +421,7 @@ graph TB
     S --> U
 ```
 
-### 3.2 核心类的 UML 类图
+### 4.2 核心类的 UML 类图
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -492,7 +492,7 @@ graph TB
 └─────────────────────────────────────────────────────────┘
 ```
 
-### 3.3 虚拟化系统（V）架构
+### 4.3 虚拟化系统（V）架构
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -532,7 +532,7 @@ graph TB
         # ... 所有内部代码通过 V.graph 访问当前图
 ```
 
-### 3.4 后端注册架构
+### 4.4 后端注册架构
 
 ```
 codegen/common.py:400  register_backend_for_device()
@@ -557,7 +557,7 @@ codegen/common.py:400  register_backend_for_device()
 
 ## 五、关键源码讲解
 
-### 4.1 编译入口：compile_fx_inner
+### 5.1 编译入口：compile_fx_inner
 
 **文件**：[compile_fx.py:787](torch/_inductor/compile_fx.py#L787)
 
@@ -612,7 +612,7 @@ Step 4: 后处理 (L1146)
     # 包括 CUDA Graph 封装等
 ```
 
-### 4.2 编排器：fx_codegen_and_compile
+### 5.2 编排器：fx_codegen_and_compile
 
 **文件**：[compile_fx.py:1772](torch/_inductor/compile_fx.py#L1772)
 
@@ -632,7 +632,7 @@ def fx_codegen_and_compile(gm, example_inputs, inputs_to_check, ...) -> OutputCo
     return scheme.codegen_and_compile(gm, example_inputs, inputs_to_check, graph_kwargs)
 ```
 
-### 4.3 核心编译器：_InProcessFxCompile.codegen_and_compile
+### 5.3 核心编译器：_InProcessFxCompile.codegen_and_compile
 
 **文件**：[compile_fx.py:1234](torch/_inductor/compile_fx.py#L1234)
 
@@ -678,7 +678,7 @@ def codegen_and_compile(self, gm, example_inputs, inputs_to_check, graph_kwargs)
     return CompiledFxGraph(compiled_fn, ...)
 ```
 
-### 4.4 FX → IR 翻译：GraphLowering
+### 5.4 FX → IR 翻译：GraphLowering
 
 **文件**：[graph.py:356](torch/_inductor/graph.py#L356)
 
@@ -783,7 +783,7 @@ FX Node: aten.add(TensorProxy, TensorProxy)
     ▼ 送入下一道工序：调度与融合
 ```
 
-### 4.5 算子 Lowering 注册表
+### 5.5 算子 Lowering 注册表
 
 **文件**：[lowering.py](torch/_inductor/lowering.py)
 
@@ -817,7 +817,7 @@ def mm(self, other):
     # 4. 返回 TensorBox(ExternKernel 或 TemplateBuffer)
 ```
 
-### 4.6 调度器：Scheduler
+### 5.6 调度器：Scheduler
 
 **文件**：[scheduler.py:3078](torch/_inductor/scheduler.py#L3078)
 
@@ -864,7 +864,9 @@ def create_scheduler_node(self, op):
 
 **加工步骤 3：贪心融合算法**
 ```python
-# L3189-3191: 节点融合
+# 以下为简化伪代码，展示核心逻辑。实际实现见 scheduler.py
+# 涉及 can_fuse 的 backend dispatch、score_fusion 的 LookupTableChoices
+# 以及 FusedSchedulerNode 的多种子类型，详见阶段四
 while True:
     # 1. 找到所有融合机会
     fusion_candidates = []
@@ -873,7 +875,7 @@ while True:
             if can_fuse(node1, node2):
                 score = score_fusion(node1, node2)
                 fusion_candidates.append((score, i, node2))
-    
+
     # 2. 按分数从高到低尝试融合
     for score, i, node2 in sorted(fusion_candidates, reverse=True):
         if can_fuse(self.nodes[i], node2):  # 再次验证
@@ -982,7 +984,7 @@ Triton/C++ Kernel 代码
     │  包含：编译后的函数 + 源代码 + 缓存信息
 ```
 
-### 4.7 依赖分析
+### 5.7 依赖分析
 
 **文件**：[dependencies.py](torch/_inductor/dependencies.py)
 
@@ -1005,7 +1007,7 @@ WeakDep(name)  ── 弱依赖（仅影响排序，不阻止融合）
 
 `extract_read_writes()` 函数通过安装分析 handler 并运行 loop body 函数来收集读写信息。
 
-### 4.8 编译产物封装：CompiledFxGraph
+### 5.8 编译产物封装：CompiledFxGraph
 
 **文件**：[output_code.py:445](torch/_inductor/output_code.py#L445)
 
@@ -1029,7 +1031,7 @@ class CompiledFxGraph(OutputCode):
 
 ## 六、核心技术
 
-### 5.1 延迟求值（Lazy Evaluation）与数据流加工
+### 6.1 延迟求值（Lazy Evaluation）与数据流加工
 
 Inductor 不是在 lowering 时就生成代码，而是构建一个**延迟求值的 IR 图**，这是整个编译管线的核心设计理念。
 
@@ -1107,7 +1109,7 @@ Inductor 延迟执行：
 2. **布局优化依赖它**：`FlexibleLayout` 允许在调度阶段才决定最终内存布局
 3. **内存优化依赖它**：调度器看到完整的 IR 图后，才能做全局内存规划
 
-### 5.2 虚拟化操作系统（V.ops）
+### 6.2 虚拟化操作系统（V.ops）
 
 **文件**：[virtualized.py](torch/_inductor/virtualized.py)
 
@@ -1143,7 +1145,7 @@ class Virtualized(Generic[T]):
 2. **编译期全局状态**：`V.graph` — 整个编译期间不变，但不适合做真正的全局变量
 3. **Define-by-Run 解释切换**：`V.ops` — 替换不同 handler 实现代码生成、分析、传播等不同语义
 
-### 5.3 算子分解（Decomposition）
+### 6.3 算子分解（Decomposition）
 
 **设计思想**：将复杂算子拆解为更基础的组合，让优化在更细粒度上进行。
 
@@ -1161,7 +1163,7 @@ def log2(x):
 - 分解后的算子更容易被 Inlining 和 Fusion 优化
 - 代价是分解后的碎片如果没有被重新融合，性能会变差（这就是为什么 Inlining + Fusion 如此重要）
 
-### 5.4 融合算法
+### 6.4 融合算法
 
 **设计思想**：贪心算法，通过评分排序来决定融合顺序。
 
@@ -1185,7 +1187,7 @@ while 还有融合机会:
 - 估计节省的内存流量字节数
 - 原始图中的节点距离（距离近的优先融合）
 
-### 5.5 符号形状（Symbolic Shapes）
+### 6.5 符号形状（Symbolic Shapes）
 
 **设计思想**：张量大小用 SymPy 符号变量表示（如 `s0`, `s1`），而非具体数值。
 
@@ -1201,7 +1203,7 @@ while 还有融合机会:
 └── Meta Functions：在符号形状上传播输出形状（覆盖 2657/3028 个算子）
 ```
 
-### 5.6 后端代码生成
+### 6.6 后端代码生成
 
 生成的 Triton kernel 示例（论文 Figure 3，`torch.log2` 的最终输出）：
 
@@ -1575,122 +1577,3 @@ print(f"Match: {torch.allclose(eager_result, compiled_result, atol=1e-5)}")
 
 ---
 
-## 九、数据流加工总结
-
-### 完整的数据加工流水线
-
-Inductor 的编译管线本质上是一个**四道工序的深度加工流水线**，每道工序都将输入数据加工成特定的形态，为下一道工序做好准备。以下是完整的加工过程总结：
-
-#### 原始材料
-- **输入**：用户 Python 函数
-- **形态**：动态执行的代码，即时计算
-- **特点**：每次调用都重新执行，无法优化
-
-#### 第一道工序：前处理工段
-**目标**：将原始 Python 代码转化为标准化的计算图
-
-**加工过程**：
-1. **view_to_reshape**
-   - 输入：带 view 操作的 FX 图
-   - 加工：将 expand/permute/squeeze 等统一为 reshape
-   - 变化：减少操作的特殊性，统一格式
-   - 价值：为后续布局优化创造条件
-
-2. **FakeTensorProp**
-   - 输入：FX 图 + 初始形状环境
-   - 加工：用 FakeTensor 运行图，传播精确形状和类型
-   - 变化：所有节点都有确定的输入输出形状
-   - 价值：消除不确定性，建立优化基础
-
-3. **_recursive_post_grad_passes**
-   - 输入：完整的前向+反向图
-   - 加工：应用优化 pass（常量折叠、融合等）
-   - 变化：简化计算图，消除冗余
-   - 价值：减少后续处理复杂度
-
-**产出品**：标准化的 FX 计算图，形状已确定，结构已简化
-
-#### 第二道工序：IR 构建工段
-**目标**：将计算图转化为可优化的中间表示
-
-**加工过程**：
-1. **节点翻译 (FX → IR)**
-   - 输入：FX 节点及其参数
-   - 加工：应用 lowering 函数，创建 IR 节点
-   - 变化：从动态语义 → 静态 IR 表示
-   - 价值：建立可优化的计算单元
-
-2. **延迟求值包装**
-   - 输入：IR 节点
-   - 加工：TensorBox → StorageBox → Buffer 包装
-   - 变化：增加延迟计算能力
-   - 价值：支持全局优化
-
-3. **算子分解**
-   - 输入：复杂算子 IR 节点
-   - 加工：拆解为多个简单算子
-   - 变化：大算子 → 小算子序列
-   - 价值：让优化在更细粒度上进行
-
-**产出品**：延迟求值的 IR DAG，带符号形状，可进行优化
-
-#### 第三道工序：调度与融合工段
-**目标**：将 IR 图优化为高效的执行计划
-
-**加工过程**：
-1. **依赖分析**
-   - 输入：IR DAG 和读写访问模式
-   - 加工：构建内存依赖图
-   - 变化：从计算 DAG → 带约束的依赖图
-   - 价值：确定并行和融合可能性
-
-2. **节点融合**
-   - 输入：依赖图和候选融合对
-   - 加工：贪心算法评分并应用融合
-   - 变化：多个小节点 → 少量大节点
-   - 价值：减少启动开销，提升利用率
-
-3. **内存规划**
-   - 输入：融合后的 DAG
-   - 加工：计算最优内存布局
-   - 变化：添加内存分配决策
-   - 价值：最小化内存流量
-
-**产出品**：优化后的执行计划，包含融合决策和内存优化
-
-#### 第四道工序：代码生成工段
-**目标**：将优化计划转化为硬件特化的代码
-
-**加工过程**：
-1. **内核代码生成**
-   - 输入：调度节点和优化决策
-   - 加工：生成 Triton/C++ kernel
-   - 变化：从 IR 描述 → 实际代码
-   - 价值：生成硬件特化的高性能实现
-
-2. **Host 代码生成**
-   - 输入：内核接口
-   - 加工：生成数据传输和管理代码
-   - 变化：从纯计算 → 完整程序
-   - 价值：确保正确集成和执行
-
-3. **封装优化**
-   - 输入：源代码和配置
-   - 加工：编译和包装为可调用对象
-   - 变化：从代码 → 动态加载模块
-   - 价值：提供标准化接口
-
-**最终产品**：
-- **性能**：比原始代码快 1.91x（推理）或 1.45x（训练）
-- **优化**：融合、内存重排序、向量化、SIMD 利用
-- **通用性**：支持动态形状、多种设备、多种数据类型
-- **兼容性**：保持与原始 PyTorch 语义完全一致
-
-### 关键数据转变点
-
-1. **Python 代码 → FX 图**：从动态执行到静态表示
-2. **FX 图 → IR 图**：从即时计算到延迟求值
-3. **IR 图 → 调度图**：从孤立节点到优化组合
-4. **调度图 → 可执行代码**：从抽象描述到具体实现
-
-每一步转变都是一次质的提升，将原本低效的动态执行转化为高效的静态优化，这正是 Inductor 编译管线的核心价值所在。

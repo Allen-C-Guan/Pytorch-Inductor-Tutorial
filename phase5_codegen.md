@@ -7,7 +7,9 @@
 > - TorchInductor 设计帖: [dev-discuss.pytorch.org/t/torchinductor](https://dev-discuss.pytorch.org/t/torchinductor-a-pytorch-native-compiler-with-define-by-run-ir-and-symbolic-shapes/747)
 > - Inductor 文件结构讨论: [dev-discuss.pytorch.org/t/inductor-file-structure-explanation](https://dev-discuss.pytorch.org/t/inductor-file-structure-explanation/1860)
 >
-> **源码版本**：基于 `main` 分支（2026-04 截取），核心文件行号以实际代码为准。
+> **源码版本**：基于 `main` 分支截取（最近变更: commit `d63aab0`, 2026-04-07），行号可能随代码演进偏移，请以实际源码为准。
+>
+> **系列导航**：[全景总览](inductor_overview.md) | [← 阶段一：全局观](phase1_global_view.md) | [← 阶段二：FX 优化](phase2_fx_optimization.md) | [← 阶段三：Lowering](phase3_lowering.md) | [← 阶段四：调度与融合](phase4_scheduling_fusion.md) | **阶段五：代码生成**
 
 ---
 
@@ -73,7 +75,7 @@ class DeviceCodegen:
 
 ### 1.5 Define-by-Run IR 在代码生成中的威力
 
-论文的核心创新——define-by-run IR——在代码生成阶段发挥了关键作用：
+论文的核心创新——define-by-run IR——在代码生成阶段发挥了关键作用（V.ops 的基础概念已在阶段三和阶段四中建立，此处展示其在代码生成阶段的具体应用）：
 
 ```python
 # 同一个 inner_fn 闭包，通过替换 V.ops 实现不同语义
@@ -631,7 +633,7 @@ class WorkSharing:
         self.code.writeline("#pragma omp single")
 ```
 
-**LoopLevel**（`cpp.py:5786-5825`）生成带 OpenMP 指令的循环：
+**LoopLevel**（`cpp.py:5743-5825`）生成带 OpenMP 指令的循环：
 
 ```python
 def lines(self):
@@ -699,7 +701,7 @@ def _generate_kernel_call_helper(self, kernel_name, call_args, *, device, triton
 **Wrapper 组装**（`wrapper.py:2078-2161`）：
 
 ```python
-def _generate(self):
+def _generate(self, is_inference):
     result = IndentedBuffer()
     result.splice(self.imports)       # import 语句
     result.splice(self.header)        # 辅助函数定义
@@ -822,7 +824,7 @@ class TilingSelect:
 
 ### 6.4 内存池化规划——MemoryPlanner 的 5 阶段管线
 
-**MemoryPlanner**（`memory_planning.py:647-816`）：
+**MemoryPlanner**（`memory_planning.py:648-816`）：
 
 ```python
 def plan(self, lines):
@@ -960,6 +962,8 @@ def triton_poi_fused_add_relu_0(in_ptr0, in_ptr1, out_ptr2,
 ```
 
 ### 7.3 生成的 C++ Kernel 示例
+
+> 以下示例基于 `TORCH_LOGS="inductor"` 实际输出构造，省略了部分边界处理以突出核心结构。
 
 **标量 Kernel**：
 
@@ -1612,7 +1616,7 @@ CSE                  TritonCSE (mask-aware)                 CSE (dtype-aware)
 | `codegen/cpp.py` | L4109 | `CppKernelProxy` kernel 类型代理 |
 | `codegen/cpp.py` | L4768 | `CppScheduling` C++ 调度策略 |
 | `codegen/cpp.py` | L5690 | `WorkSharing` OpenMP 并行管理 |
-| `codegen/cpp.py` | L5786 | `LoopLevel` 循环级别（带 pragma） |
+| `codegen/cpp.py` | L5743 | `LoopLevel` 循环级别（带 pragma） |
 | `codegen/wrapper.py` | L882 | `AllocateLine` 内存分配行 |
 | `codegen/wrapper.py` | L1006 | `FreeIfNotReusedLine` 条件释放行 |
 | `codegen/wrapper.py` | L1073 | `ReuseLine` buffer 复用行 |

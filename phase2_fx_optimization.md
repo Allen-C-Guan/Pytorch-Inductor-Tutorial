@@ -8,7 +8,7 @@
 > - Efficient ConvBN 论文: *"Efficient ConvBN Blocks for Transfer Learning and Beyond"* (arXiv:2305.11624)
 > - PyTorch SDPA 文档: [pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention](https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html)
 >
-> **源码版本**：基于 `main` 分支（2026-04 截取），核心文件行号以实际代码为准。
+> **源码版本**：基于 `main` 分支截取（最近变更: commit `d63aab0`, 2026-04-07），行号可能随代码演进偏移，请以实际源码为准。
 >
 > **系列导航**：[全景总览](inductor_overview.md) | [← 阶段一：全局观](phase1_global_view.md) | **阶段二：FX 优化** | [阶段三：Lowering →](phase3_lowering.md) | [阶段四：调度与融合 →](phase4_scheduling_fusion.md) | [阶段五：代码生成 →](phase5_codegen.md)
 
@@ -61,7 +61,7 @@ FX 优化分布在**三个不同阶段**，每个阶段操作的 IR 形态不同
 - 方式：通过 `register_replacement()` 或 `register_graph_pattern()` 注册
 - 结果：减少节点数量或替换为更高效的算子
 
-**协同关系**：分解将大算子拆碎，模式匹配将碎片重新组合为高效形式。两者缺一不可——论文消融实验证明，去掉融合+内联后，分解的碎片化反而导致性能下降 86%。
+**协同关系**：分解将大算子拆碎，模式匹配将碎片重新组合为高效形式。两者缺一不可——论文 Table 4 消融实验证明，去掉 Fusion+Inlining 后，推理加速从 1.91x 变为 0.80x（反而比 eager 模式更慢）。（Inlining 的具体机制详见阶段三 1.4 节和 7.1 节）
 
 ---
 
@@ -112,7 +112,7 @@ compile_fx.py:787  compile_fx_inner(gm, example_inputs, ...)
 ### 2.2 模式匹配引擎调用栈
 
 ```
-pattern_matcher.py:2053  PatternMatcherPass.apply(gm)
+pattern_matcher.py:2079  PatternMatcherPass.apply(gm)  # 类定义在 L2053
     │
     ├── 计算突变区域 ID（如有必要）
     │
@@ -245,6 +245,7 @@ post_grad_passes(gm, is_inference)
   - 减少：冗余 view/permute/cat 节点
   - 减少：死代码、noop 操作
   - 标准化：所有算子使用 ATen 标准表示
+  - 前后向图已分离（AOTAutograd min-cut 分离完成）
 
 **数据流示意**：
 
@@ -853,15 +854,7 @@ def post_grad_passes(gm, is_inference):
 
 **为什么 Post-grad 有三轮模式匹配？**
 
-```
-初始图：
-  A → B → C
-  第一轮后：A+C → D（替换可能产生新模式）
-  第二轮后：D → E（进一步优化）
-  第三轮后：无新变化（收敛）
-```
-
-每一轮替换都可能暴露出新的可匹配模式。三轮通常足以收敛。如果需要更多轮，可以通过 `config.post_grad_fusion_options` 添加额外的 Pass。
+源码中 `pass_patterns = [PatternMatcherPass(), PatternMatcherPass(), PatternMatcherPass()]` 创建了三个**独立的** `PatternMatcherPass` 实例。不同类型的模式注册到不同的索引中（例如 attention 融合模式、matmul 融合模式等各自注册到特定的 `pass_patterns` 槽位）。三轮并非同一 Pass 反复执行直到收敛，而是三组不同模式依次应用。如果需要额外的模式处理，可通过 `config.post_grad_fusion_options` 注册更多 Pass。
 
 ---
 
