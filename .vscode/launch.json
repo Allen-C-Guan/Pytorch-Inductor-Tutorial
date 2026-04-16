@@ -1,0 +1,30 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "pytorch_tutorial",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "python": "/opt/homebrew/Caskroom/miniforge/base/envs/pt-inductor/bin/python",
+            "cwd": "${fileDirname}",
+            "env": {
+                "CONDA_PREFIX": "/opt/homebrew/Caskroom/miniforge/base/envs/pt-inductor"
+            }
+        },
+        {
+            "name": "pytorch_tutorial (with Inductor logs)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "python": "/opt/homebrew/Caskroom/miniforge/base/envs/pt-inductor/bin/python",
+            "cwd": "${fileDirname}",
+            "env": {
+                "CONDA_PREFIX": "/opt/homebrew/Caskroom/miniforge/base/envs/pt-inductor",
+                "TORCH_LOGS": "+inductor"
+            }
+        }
+    ]
+}
