@@ -65,9 +65,374 @@ FX 优化分布在**三个不同阶段**，每个阶段操作的 IR 形态不同
 
 ---
 
-## 二、主体核心调用栈
+## 二、编译器背景知识
 
-### 2.1 FX Pass 在编译管线中的位置
+> 本节为 FX 图级优化提供必要的编译器理论背景。我们将从经典编译器优化理论出发，建立与 Inductor FX 优化体系的概念映射。通过理解"通用编译器如何做优化"，读者能更深刻地理解"Inductor 为什么这样设计它的 Pass 体系"。
+>
+> **核心教材**：Keith D. Cooper & Linda Torczon, *Engineering a Compiler*, 3rd Edition (以下简称 EAC3e)。
+
+### 2.1 图优化基本原理
+
+#### 原理
+
+编译器优化的核心思想建立在**数据流分析 (Dataflow Analysis)** 之上。EAC3e Chapter 8 "Introduction to Optimization" 系统阐述了四大经典优化技术：
+
+| 优化技术 | 分析基础 | 效果 |
+|---------|---------|------|
+| 公共子表达式消除 (CSE) | 可用表达式 (Available Expressions) | 避免重复计算 |
+| 死代码消除 (DCE) | 活跃变量分析 (Liveness Analysis) | 删除无用代码 |
+| 常量传播 (Constant Propagation) | 定值-引用链 (Def-Use Chains) | 编译期求值 |
+| 常量折叠 (Constant Folding) | 类型 + 常量信息 | 简化运算 |
+
+这些技术的共同模式是：**先通过数据流分析收集程序语义信息，再利用这些信息证明某个变换是安全的 (safe) 且保持语义等价的 (semantics-preserving)，最后执行变换。**
+
+在图 IR (Graph IR) 中，上述分析可以自然地表述为**图上的前向/后向传播**问题。以 CSE 为例：
+
+```
+           数据流分析视角                图优化视角
+
+   b1: a = x + y                 Node_1: add(x, y) → a
+       b = x + y                 Node_2: add(x, y) → b   ← 与 Node_1 相同
+       c = a * b                 Node_3: mul(a, b) → c
+
+   分析：在 b1 入口处，x+y 是可用表达式
+   结论：b = x + y 可替换为 b = a（CSE）    结论：Node_2 冗余，重定向其用户到 Node_1
+
+   优化后：
+   b1: a = x + y                 Node_1: add(x, y) → a
+       c = a * a                 Node_3: mul(a, a) → c   ← 直接引用 a
+```
+
+代数化简 (Algebraic Simplification) 则不需要数据流分析，它依赖代数恒等式：
+
+```
+x + 0 → x      x * 1 → x      x * 0 → 0
+x - x → 0      x / x → 1      pow(x, 0) → 1
+```
+
+这些规则可以视为**模式匹配**的最简形式——编译器在 AST/图上扫描，遇到匹配的模式直接替换。
+
+#### 为什么在 Inductor 中需要
+
+Dynamo 通过字节码追踪 (bytecode tracing) 从 Python 程序生成 FX Graph。这个追踪过程是**机械的**——它忠实地记录 Python 执行路径上的每一个函数调用，而不做任何"聪明"的判断。这导致产出的 FX Graph 中大量存在：
+
+1. **冗余计算**：Python 代码中多次出现的相同表达式被重复追踪为独立节点
+2. **低效模式**：用户手写的 attention 实现包含多个 matmul + softmax，而非单个 SDPA 调用
+3. **无意义的操作链**：view → view → reshape、permute → permute 等可消除的序列
+4. **标准化差异**：同一数学运算可能有多种 ATen 表示（如 `log2` vs `log * constant`）
+
+如果不做图级优化，这些低效模式会直接传递到 Lowering 和 Codegen 阶段，导致生成次优的 kernel 代码。**FX 图级优化的价值在于：在图级别消除这些可识别的低效模式，为后续阶段提供更干净、更紧凑的 IR。**
+
+#### 在本模块的具体体现
+
+Inductor 的 FX 优化体系通过三个机制实现上述经典优化：
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                  Inductor FX 优化三机制                          │
+├────────────────────────────────────────────────────────────────┤
+│                                                                │
+│  1. 模式匹配引擎 (PatternMatcherPass)                           │
+│     ├── 对应：代数化简 + 特定模式替换                             │
+│     ├── 实现：28+ SDPA 模式、Conv-BN 融合、pointless_view 等     │
+│     └── 分布在：pre_grad / joint_graph / post_grad 三个阶段      │
+│                                                                │
+│  2. 算子分解表 (Decomposition Table)                             │
+│     ├── 对应：将复杂表达式展开为基本运算                           │
+│     ├── 实现：log2 → log*constant, silu → x/(1+exp(-x)) 等      │
+│     └── 时机：在 Pass 之前和期间触发                              │
+│                                                                │
+│  3. 标准图变换 (Graph Transforms)                                │
+│     ├── 对应：DCE、noop 消除、in-place 转换                      │
+│     ├── 实现：eliminate_dead_code(), remove_noop_ops(),          │
+│     │         reinplace_inplaceable_ops()                        │
+│     └── 分布在：post_grad 阶段集中执行                            │
+│                                                                │
+└────────────────────────────────────────────────────────────────┘
+```
+
+这三个机制协同工作，覆盖了 EAC3e Ch.8 所描述的经典优化集合在 ML 编译场景下的特化版本。
+
+### 2.2 算子融合策略
+
+#### 原理
+
+EAC3e Chapter 9 "Loop Optimizations" 讨论了**循环融合 (Loop Fusion)** 的判据——将多个相邻循环合并为单个循环，消除中间数组的读写。融合的关键收益是：
+
+1. **减少内存带宽消耗**：中间结果不需要写回内存再读入，而是留在寄存器/缓存中直接传递给下一个操作
+2. **减少内存分配**：中间张量不需要实际分配存储空间
+3. **增加指令级并行 (ILP)**：融合后的循环体包含更多可调度的操作
+
+融合的判据不是"能融就融"。EAC3e 指出需要考虑：
+
+```
+融合可行性判断：
+
+  循环 A: for i in range(N): a[i] = f(x[i])
+  循环 B: for i in range(N): y[i] = g(a[i])
+
+  可以融合 ⟺
+    ├── 数据依赖满足：B 的每次迭代只依赖 A 的对应迭代 (无跨迭代依赖)
+    ├── 不引入额外计算：融合后不增加总运算量
+    └── 寄存器压力可控：融合后循环体不会因寄存器溢出而变慢
+```
+
+在 ML 编译器的语境中，上述"循环"对应于**逐元素 (elementwise) 操作**的隐式循环。对于逐元素操作，融合判据天然成立——每个输出元素的计算只依赖对应的输入元素，不存在跨迭代依赖。
+
+```
+ML 场景中的融合示例：
+
+  未融合（两次内存读写）：
+  temp[i] = relu(x[i])      ← 写 temp，读 x
+  y[i]    = sigmoid(temp[i]) ← 写 y，读 temp
+
+  融合后（一次内存读写）：
+  y[i] = sigmoid(relu(x[i]))  ← 写 y，读 x（temp 消失）
+```
+
+#### 为什么在 Inductor 中需要
+
+ML 工作负载有一个关键特征：**它们通常是内存带宽受限 (memory-bound) 的，而非计算受限 (compute-bound)**。这意味着：
+
+- 一个逐元素 ReLU 的执行时间主要花在"从显存读取数据"上，而非"计算 max(0, x)"上
+- 两个相邻的逐元素操作（如 ReLU + Sigmoid）如果分别执行，数据需要 写→读→写→读，总带宽翻倍
+- 如果融合为一个 kernel，数据只需 读→计算→计算→写，中间结果留在寄存器中
+
+```
+内存带宽瓶颈示意：
+
+  GPU 计算单元 (SM)          GPU 显存 (HBM)
+  ┌──────────┐              ┌──────────┐
+  │ 计算力充裕 │ ←── 带宽瓶颈 ──→ │ 数据量大  │
+  │ (TFLOPS)  │    ~2 TB/s     │ (GBs)    │
+  └──────────┘              └──────────┘
+
+  对于逐元素操作：
+  FLOPs/Byte ≈ 1（每字节只做 ~1 次运算）
+  → SM 大部分时间在等待数据 → 内存受限
+  → 融合减少访存次数 → 直接提升性能
+```
+
+这是 Inductor 为什么要把"算子融合"作为核心优化的根本原因。
+
+#### 在本模块的具体体现
+
+Inductor 的融合发生在**两个不同层级**：
+
+1. **图级融合 (FX Pass 阶段)**：通过模式匹配识别特定的融合机会，替换为语义等价但更高效的单个算子。这是本模块的核心工作。
+
+2. **调度级融合 (Scheduling 阶段，Phase 4)**：在 Lowering 之后的 Scheduler 将连续的逐元素操作自动融合为单个 kernel（基于 EAC3e Ch.9 的循环融合思想）。
+
+在 FX Pass 阶段，融合主要体现为两类：
+
+```
+类别 A：语义级融合（需要理解数学语义）
+├── Attention 融合：matmul + scale + softmax + matmul → SDPA
+│   └── 收益：启用 Flash Attention 等硬件特化 kernel
+├── Conv-BN 融合：conv + batch_norm → conv（权重预折叠）
+│   └── 收益：消除 BN 的均值/方差计算和额外内存访问
+└── Group Normalization 融合：多个小操作 → 标准化算子
+    └── 收益：减少 kernel launch 开销
+
+类别 B：结构级融合（只需分析图结构）
+├── Cat/Permute 融合：合并相邻的 cat/permute 操作
+├── Split/Cat 消除：split 后立即 cat → 恒等变换
+└── Group Batch 融合：将独立操作批量化执行
+```
+
+Attention 融合是类别 A 中最重要的案例，它体现了"领域知识驱动的融合"——只有理解 Q*K^T*softmax*V 的数学语义是 attention，才能将其替换为 SDPA 算子，从而在运行时调用 Flash Attention 等 IO 感知的高效实现。
+
+### 2.3 算子分解与模式匹配
+
+#### 原理
+
+EAC3e Chapter 10 "Instruction Selection" 介绍了两种经典的指令选择算法：
+
+1. **树模式匹配 (Tree Pattern Matching)**：将目标机器的指令集建模为树模式，在表达式树上做最大消耗 (Maximal Munch) 或动态规划匹配
+2. **DAG 覆盖 (DAG Covering)**：将树模式匹配扩展到有向无环图，处理公共子表达式
+
+这些技术的核心思想是：**一个高级语言的操作可能有多种等价的底层实现，编译器的任务是从中选择最优的一个。** 这个选择过程可以分解为两步：
+
+```
+Step 1: Decomposition（分解）
+  高级操作 → 一组基本操作的组合
+  例如：log2(x) → log(x) * (1/ln(2))
+
+Step 2: Pattern Matching（模式匹配/指令选择）
+  在基本操作组合中，识别出可映射到高效底层实现的模式
+  例如：识别 log(x) * constant → 映射到硬件 log2 指令（如果存在）
+```
+
+在传统编译器中，分解由中间表示 (IR) 的层级决定（HIR → MIR → LIR），指令选择由目标机器描述 (machine description) 驱动。在 Inductor 中，这两个步骤对应于**算子分解表 (Decomposition Table)** 和**模式匹配引擎 (PatternMatcherPass)**。
+
+#### 为什么在 Inductor 中需要
+
+PyTorch 的算子层次非常丰富：从高层的 `torch.nn.functional.scaled_dot_product_attention` 到底层的 `aten.mm`、`aten.add`，存在数百个 ATen 算子。这种丰富性带来了一个根本性问题：
+
+**一个高层算子可能存在多种等价的分解方式，而不同分解方式对后续优化的友好程度不同。**
+
+```
+以 SiLU 激活函数为例：
+
+  数学定义：silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+
+  分解方式 A：x * sigmoid(x)
+    → 节点：mul(x, sigmoid(x))
+    → sigmoid 又需分解：1 / (1 + exp(-x))
+    → 最终：mul(x, div(1, add(1, exp(neg(x)))))
+
+  分解方式 B：x / (1 + exp(-x))
+    → 节点：div(x, add(1, exp(neg(x))))
+    → 更简洁，数值更稳定
+
+  Inductor 选择 B → 因为它与 eager 模式的数值行为精确匹配
+```
+
+同时，Dynamo 追踪产出的 FX Graph 中使用的是**用户代码中实际调用的算子**，这些算子可能不在 Inductor 的 Lowering 表中（Inductor 只为约 200 个基础 ATen 算子提供 Lowering）。分解确保所有算子都被展开为 Inductor 能处理的基础操作。
+
+#### 在本模块的具体体现
+
+Inductor 的分解和模式匹配形成了一个**两阶段优化管线**：
+
+```
+                   原始 FX Graph
+                        │
+                        ▼
+            ┌──── 算子分解 (Decomposition) ────┐
+            │                                    │
+            │  高层算子 → 基础算子组合              │
+            │  log2 → log * constant             │
+            │  silu → x / (1 + exp(-x))          │
+            │  addmm → 条件分解或保留原算子         │
+            │                                    │
+            │  效果：节点数增加，但粒度更细          │
+            └──────────────┬─────────────────────┘
+                           │
+                           ▼
+            ┌──── 模式匹配 (Pattern Matching) ───┐
+            │                                    │
+            │  在细粒度图上识别高效模式             │
+            │  matmul+scale+softmax+matmul → SDPA │
+            │  conv+bn → fused_conv              │
+            │  pointless_view → eliminate         │
+            │                                    │
+            │  效果：节点数减少，替换为高效形式      │
+            └──────────────┬─────────────────────┘
+                           │
+                           ▼
+                   优化后的 FX Graph
+```
+
+这解释了 PyTorch 2 论文 (ASPLOS 2024) Table 4 的消融实验结果：去掉 Fusion+Inlining 后，推理加速从 1.91x 变为 0.80x——分解把算子拆碎了，如果没有模式匹配把它们重新组合为高效形式，拆碎后的细粒度操作反而比原始的单个高层算子更慢（更多 kernel launch、更多中间张量）。
+
+在源码中，这两个机制的对应关系为：
+
+| 机制 | 源码位置 | 注册方式 |
+|------|---------|---------|
+| 算子分解 | `decomposition.py` | `@register_decomposition([aten.op])` |
+| 模式匹配 | `pattern_matcher.py` + `fx_passes/` | `register_replacement()` / `register_graph_pattern()` |
+
+分解表的选择通过 `select_decomp_table()` 根据配置动态决定，支持运行时切换不同的分解策略。
+
+### 2.4 公共子表达式消除 (CSE)
+
+#### 原理
+
+CSE 是 EAC3e Chapter 8 的核心内容之一。其目标是：**识别程序中多次计算的相同表达式，用第一次计算的结果替代后续重复计算。**
+
+经典 CSE 算法分两步：
+
+```
+Step 1: 可用表达式分析 (Available Expressions Analysis)
+  前向数据流分析，对每个程序点计算"在此处一定已经被计算过的表达式集合"
+
+  IN[b] = ∩ OUT[p]   对所有前驱 p
+  OUT[b] = (IN[b] - KILL[b]) ∪ GEN[b]
+
+  其中：
+    GEN[b]  = b 中新产生的表达式（如 b 计算了 x+y）
+    KILL[b] = b 中被杀死的表达式（如 b 修改了 x，则含 x 的表达式不再可用）
+
+Step 2: 替换
+  如果表达式 e 在点 p 可用，且 e 的操作数未被修改，则用保存的值替换
+```
+
+在图 IR 中，CSE 变得特别简单——因为图 IR 中没有控制流（或者控制流已经被显式建模为节点），可用表达式分析退化为**结构等价检查**：如果两个节点具有相同的操作符和相同的输入，则它们计算相同的值。
+
+```
+图 IR 上的 CSE：
+
+  优化前：
+  n1 = add(x, y)
+  n2 = mul(n1, z)
+  n3 = add(x, y)    ← 与 n1 结构等价
+  n4 = mul(n3, w)
+
+  优化后：
+  n1 = add(x, y)
+  n2 = mul(n1, z)
+  n3 = n1            ← 替换为对 n1 的引用
+  n4 = mul(n1, w)    ← n3 的用户重定向到 n1
+  （n3 成为死代码，可由 DCE 清除）
+```
+
+#### 为什么在 Inductor 中需要
+
+Dynamo 的追踪过程可能导致相同的计算在图中出现多次：
+
+1. **Python 代码结构**：用户函数中多处调用了相同的子表达式（如多次 `x.relu()`）
+2. **分解的副作用**：分解一个算子可能产生与其他地方重复的子表达式
+3. **Autograd 的前向-反向重计算**：联合图中前向和反向可能各自计算了相同的中间值
+
+如果不做 CSE，这些重复计算会在 Codegen 阶段生成重复的 kernel 调用，浪费计算资源和内存带宽。
+
+#### 在本模块的具体体现
+
+Inductor 的 CSE 体现在两个层面：
+
+1. **FX Graph 级别的 CSE**：`post_grad_passes` 中的 `gm.graph.eliminate_dead_code()` 在节点被重定向后清除死代码。虽然 FX 框架本身不提供显式的 CSE Pass，但模式匹配引擎在替换节点时，会自然地产生用户重定向（新节点替换旧节点时，旧节点的用户被迁移到新节点），再配合 DCE 完成类似 CSE 的效果。
+
+2. **Lowering 之后的 CSE**：在 Inductor 的 IR 层面（Phase 3-4），有显式的 CSE Pass 处理 buffer 级别的重复计算。这是 Inductor 调度器 (Scheduler) 的重要优化之一。
+
+```
+CSE 在 Inductor 管线中的位置：
+
+FX Graph 阶段（本模块）         IR/Lowering 阶段（后续模块）
+┌─────────────────────┐      ┌─────────────────────┐
+│ 隐式 CSE：           │      │ 显式 CSE：           │
+│ 模式匹配替换后       │  →   │ ir.IRGenerator      │
+│ 旧节点的用户被       │      │ 中的 CSE Pass       │
+│ 重定向到新节点       │      │                     │
+│                     │      │ 基于 buffer name    │
+│ DCE 清除死节点      │      │ 去重                 │
+└─────────────────────┘      └─────────────────────┘
+```
+
+### 2.5 从经典编译器到 Inductor：优化 Pass 的设计模式
+
+综合以上四个知识点，我们可以总结出 Inductor FX 优化体系与经典编译器优化的对应关系：
+
+```
+经典编译器 (EAC3e)                    Inductor FX 优化
+─────────────────                    ────────────────
+
+Ch.8  CSE                          →  节点重定向 + DCE (post_grad)
+Ch.8  DCE                          →  eliminate_dead_code() (post_grad)
+Ch.8  Constant Propagation/Folding  →  分解表中的常量折叠
+Ch.8  Algebraic Simplification      →  pointless_view, pointless_permute
+Ch.9  Loop Fusion                   →  Attention 融合, Conv-BN 融合,
+                                       Group Batch 融合
+Ch.10 Instruction Selection          →  模式匹配引擎 (PatternMatcherPass)
+                                       + 算子分解表 (Decomposition)
+```
+
+理解这个映射关系后，读者可以把 Inductor 的每一个 FX Pass 都还原为经典编译器中的一个已知技术——差异仅在于 Inductor 操作的是**张量计算图**而非传统的**标量控制流图**。这种从"通用原理"到"领域特化"的思维转换，是理解 Inductor 设计决策的关键。
+
+---
+
+## 三、主体核心调用栈
+
+### 3.1 FX Pass 在编译管线中的位置
 
 ```
 compile_fx.py:787  compile_fx_inner(gm, example_inputs, ...)
@@ -109,7 +474,7 @@ compile_fx.py:787  compile_fx_inner(gm, example_inputs, ...)
     └── ...
 ```
 
-### 2.2 模式匹配引擎调用栈
+### 3.2 模式匹配引擎调用栈
 
 ```
 pattern_matcher.py:2079  PatternMatcherPass.apply(gm)  # 类定义在 L2053
@@ -147,9 +512,9 @@ pattern_matcher.py:2079  PatternMatcherPass.apply(gm)  # 类定义在 L2053
 
 ---
 
-## 三、主体流程梳理
+## 四、主体流程梳理
 
-### 3.1 数据流加工：FX Graph → 优化后的 FX Graph
+### 4.1 数据流加工：FX Graph → 优化后的 FX Graph
 
 #### 原始材料
 - **输入**：Dynamo/AOTAutograd 产出的 FX GraphModule
@@ -288,9 +653,9 @@ post_grad_passes(gm, is_inference)
 
 ---
 
-## 四、UML 图 / 架构设计
+## 五、UML 图 / 架构设计
 
-### 4.1 模式匹配引擎类图
+### 5.1 模式匹配引擎类图
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -341,7 +706,7 @@ post_grad_passes(gm, is_inference)
               └────────────────┘  └───────────────────────┘  └───────────────┘
 ```
 
-### 4.2 Pass 注册与执行架构
+### 5.2 Pass 注册与执行架构
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -392,7 +757,7 @@ post_grad_passes(gm, is_inference)
         └──────────────────────┘  └─────────────────────────────┘
 ```
 
-### 4.3 三阶段 Pass 执行时序
+### 5.3 三阶段 Pass 执行时序
 
 ```mermaid
 sequenceDiagram
@@ -435,9 +800,9 @@ sequenceDiagram
 
 ---
 
-## 五、关键思想代码讲解
+## 六、关键思想代码讲解
 
-### 5.1 PatternMatcherPass.apply() —— 模式匹配的核心循环
+### 6.1 PatternMatcherPass.apply() —— 模式匹配的核心循环
 
 **文件**：[pattern_matcher.py:2079-2155](torch/_inductor/pattern_matcher.py#L2079)
 
@@ -493,7 +858,7 @@ def apply(self, gm: torch.fx.GraphModule | torch.fx.Graph) -> int:
 3. **lazy match**：`FailedMatch` 使用惰性字符串构造，在未启用调试时不产生格式化开销。
 4. **config 守护**：`guard_or_false(entry.extra_check(m))` 允许模式在编译时做符号化的条件检查。
 
-### 5.2 register_replacement() —— 自动化的模式注册
+### 6.2 register_replacement() —— 自动化的模式注册
 
 **文件**：[pattern_matcher.py:1477-1709](torch/_inductor/pattern_matcher.py#L1477)
 
@@ -551,7 +916,7 @@ getitem               →    保持不变（不忽略整数参数）
 scalar 常量           →    直接匹配值
 ```
 
-### 5.3 register_graph_pattern() —— 自定义图变换
+### 6.3 register_graph_pattern() —— 自定义图变换
 
 **文件**：[pattern_matcher.py:1942-1961](torch/_inductor/pattern_matcher.py#L1942)
 
@@ -578,7 +943,7 @@ def fix_iota_device(match: Match, length, start, step, dtype, device, requires_g
     # 自定义的图修改逻辑
 ```
 
-### 5.4 init_once_fakemode —— 懒加载模式注册
+### 6.4 init_once_fakemode —— 懒加载模式注册
 
 **文件**：[pattern_matcher.py:2393-2422](torch/_inductor/pattern_matcher.py#L2393)
 
@@ -621,9 +986,9 @@ def lazy_init(input_device=None):
 
 ---
 
-## 六、关键源码讲解
+## 七、关键源码讲解
 
-### 6.1 Attention 融合（fuse_attention.py）
+### 7.1 Attention 融合（fuse_attention.py）
 
 **文件**：[fx_passes/fuse_attention.py](torch/_inductor/fx_passes/fuse_attention.py)
 
@@ -693,7 +1058,7 @@ serialized_patterns/
 └── mm_pattern.py        ← mm 预编译模式
 ```
 
-### 6.2 Conv-BN 融合（efficient_conv_bn_eval.py）
+### 7.2 Conv-BN 融合（efficient_conv_bn_eval.py）
 
 **文件**：[fx_passes/efficient_conv_bn_eval.py](torch/_inductor/fx_passes/efficient_conv_bn_eval.py)
 
@@ -740,7 +1105,7 @@ def efficient_conv_bn_eval_graph_transform(match, ...):
     # 直接调用 efficient_conv_bn_eval()
 ```
 
-### 6.3 算子分解（decomposition.py）
+### 7.3 算子分解（decomposition.py）
 
 **文件**：[decomposition.py](torch/_inductor/decomposition.py)
 
@@ -805,7 +1170,7 @@ assert op not in check_decomps or override_decomp, (
 
 同一个算子不能同时有分解和 lowering——否则会造成无限循环。
 
-### 6.4 Post-grad Pass 执行流程
+### 7.4 Post-grad Pass 执行流程
 
 **文件**：[fx_passes/post_grad.py:114-200](torch/_inductor/fx_passes/post_grad.py#L114)
 
@@ -858,9 +1223,9 @@ def post_grad_passes(gm, is_inference):
 
 ---
 
-## 七、核心技术
+## 八、核心技术
 
-### 7.1 模式匹配 DAG 的构建与匹配
+### 8.1 模式匹配 DAG 的构建与匹配
 
 模式匹配引擎的核心是将 Python 函数转换为**模式 DAG**，然后在 FX Graph 上进行子图同构匹配。
 
@@ -911,7 +1276,7 @@ trace 后的 FX Graph：
    - 用户数量是否匹配（`_users=MULTIPLE` 时允许多用户）
 3. **上下文管理**：`MatchContext` 跟踪已匹配的 PatternExpr → Node 映射，确保同一 PatternExpr 不会匹配到不同节点
 
-### 7.2 FakeTensor 与符号形状在模式匹配中的角色
+### 8.2 FakeTensor 与符号形状在模式匹配中的角色
 
 模式匹配过程中，`extra_check` 函数需要访问张量的形状和类型信息。这些信息由 `FakeTensor` 提供。
 
@@ -939,7 +1304,7 @@ def check_fn(match):
 - **第一次匹配**（通用模式）：忽略具体形状，只匹配算子类型和结构。快速过滤掉不可能的候选。
 - **第二次匹配**（具体模式）：使用匹配到的节点的实际形状信息重新 trace，进行精确验证。
 
-### 7.3 stable_topological_sort —— 保持稳定排序
+### 8.3 stable_topological_sort —— 保持稳定排序
 
 **文件**：[pattern_matcher.py:2357-2391](torch/_inductor/pattern_matcher.py#L2357)
 
@@ -967,7 +1332,7 @@ def stable_topological_sort(graph: torch.fx.Graph) -> None:
             waiting[last_dep].append(node)
 ```
 
-### 7.4 gen_register_replacement —— 预编译模式机制
+### 8.4 gen_register_replacement —— 预编译模式机制
 
 **目的**：避免每次启动都 trace 28+ 个 SDPA 模式的开销。
 
@@ -985,7 +1350,7 @@ view_default = CallFunction(aten.view.default, expand_default, Ignored(), _users
 
 ---
 
-## 八、自主学习 Debug 路线
+## 九、自主学习 Debug 路线
 
 ### 路线总览
 
@@ -1275,9 +1640,9 @@ print(f"Registered patterns: {dict(my_patterns.patterns)}")
 
 ---
 
-## 九、数据流加工过程重点
+## 十、数据流加工过程重点
 
-### 9.1 FX Graph 在三阶段优化中的形态演变
+### 10.1 FX Graph 在三阶段优化中的形态演变
 
 ```
 阶段 0: 原始 FX Graph（Dynamo 产出）
@@ -1339,7 +1704,7 @@ print(f"Registered patterns: {dict(my_patterns.patterns)}")
    └── 准备进入 Lowering 阶段
 ```
 
-### 9.2 关键转变点分析
+### 10.2 关键转变点分析
 
 **转变 1：手动 Attention → SDPA（最大粒度的优化）**
 
@@ -1384,7 +1749,7 @@ view(x, shape2)  ← 无效操作
 reshape(x, final_shape)
 ```
 
-### 9.3 每个优化在整体管线中的价值
+### 10.3 每个优化在整体管线中的价值
 
 | 优化 | 阶段 | 价值 |
 |------|------|------|
@@ -1398,7 +1763,7 @@ reshape(x, final_shape)
 
 ---
 
-## 十、交叉校验报告
+## 十一、交叉校验报告
 
 > 校验时间：2026-04-15
 > 校验方法：对比 PyTorch 2 论文 (ASPLOS 2024)、TorchInductor 设计帖 (dev-discuss #747)、PyTorch 源码 (main 分支)

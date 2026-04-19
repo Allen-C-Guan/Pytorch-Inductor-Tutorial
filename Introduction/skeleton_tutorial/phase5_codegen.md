@@ -90,9 +90,383 @@ with V.set_ops_handler(CppOverrides()):            # CPU 路径
 
 ---
 
-## 二、主体核心调用栈
+## 二、编译器背景知识
 
-### 2.1 从调度器到最终产物的完整调用链
+> **定位**：本节梳理代码生成（Code Generation）相关的经典编译器理论，建立"原理 → 为什么在 Inductor 中需要 → 在本模块中的具体体现"的三层认知结构。参考教材为 *Engineering a Compiler* (Keith D. Cooper & Linda Torczon, 3rd Edition)，各知识点标注对应章节号。
+
+### 2.1 代码生成基本原理
+
+**参考**：Engineering a Compiler 第 10 章 "Instruction Selection"（树匹配、DAG 覆盖、基于模式匹配的指令选择）；第 7 章 "The Back End"（代码生成管线概述）。
+
+#### 原理
+
+代码生成（Code Generation）是编译器后端的核心任务，负责将中间表示（IR）上的操作映射到具体目标机器的指令或程序。经典的代码生成管线包含三个子问题：
+
+```
+IR 操作（高级抽象）
+    │
+    ├── 指令选择（Instruction Selection）
+    │   将 IR 操作映射到目标指令集中的具体指令
+    │   方法：树覆盖（tree covering）、DAG 覆盖、窥孔优化
+    │
+    ├── 指令调度（Instruction Scheduling）
+    │   决定指令的执行顺序，利用指令级并行，避免流水线停顿
+    │
+    └── 寄存器分配（Register Allocation）
+        将无限的虚拟寄存器映射到有限的物理寄存器
+```
+
+指令选择的核心是**模式匹配**：编译器预先定义一组 "IR 模式 → 目标指令" 的映射规则，然后对 IR 树/ DAG 进行匹配，选择代价最小的指令序列。例如，一个 `load + add + store` 的 IR 子树可以被一条 `ADD [mem], reg` 指令覆盖，从而减少独立的 load 和 store 操作。
+
+#### 为什么在 Inductor 中需要
+
+Inductor 的 IR（`Buffer`、`IRNode`、`Loops`）是平台无关的中间表示。这些 IR 节点不能直接在 GPU 或 CPU 上执行——必须翻译为 Triton GPU kernel 或 C++ CPU kernel。本质上，这就是编译器的指令选择问题：将抽象的 IR 操作（`V.ops.exp`、`V.ops.load`、`V.ops.store`）映射到目标语言的具体语句（`tl.exp()`、`std::exp()`）。
+
+#### 在本模块中的具体体现
+
+Inductor 通过 **V.ops handler 替换** 实现指令选择：
+
+```python
+# GPU 路径：IR 操作 → Triton 指令
+with V.set_ops_handler(TritonKernelOverrides()):
+    inner_fn(indices)   # V.ops.exp → "tl.exp(x)"
+                        # V.ops.load → "tl.load(ptr + offset, mask)"
+
+# CPU 路径：IR 操作 → C++ 指令
+with V.set_ops_handler(CppOverrides()):
+    inner_fn(indices)   # V.ops.exp → "std::exp(x)"
+                        # V.ops.load → "ptr[index]"
+```
+
+每个 V.ops handler 就是一组 "IR 模式 → 目标指令" 的映射规则，等价于经典编译器中的指令选择模板。`TritonKernelOverrides` 和 `CppOverrides` 分别定义了 GPU 和 CPU 的指令集映射。
+
+```
+经典编译器                        Inductor
+──────────                       ────────
+IR 树/DAG                        IRNode 树 (Buffer → ComputedBuffer → IR)
+    │                                │
+指令选择规则表                    V.ops handler (TritonKernelOverrides / CppOverrides)
+    │                                │
+目标机器指令                      Triton 源码 / C++ 源码
+```
+
+### 2.2 公共子表达式消除（CSE）在代码生成阶段
+
+**参考**：Engineering a Compiler 第 8 章 "Introduction to Optimization"（CSE 算法、可用表达式分析）。
+
+#### 原理
+
+公共子表达式消除（Common Subexpression Elimination, CSE）是最经典的编译器优化之一。其核心思想：如果两个或多个位置计算出完全相同的表达式（子表达式），且该表达式在第二次遇到时仍然是"可用的"（即中间没有被重新定义），则只需计算一次，后续引用可直接使用前次结果。
+
+```
+优化前：                         CSE 优化后：
+t1 = a + b                      t1 = a + b
+t2 = c * t1                     t2 = c * t1
+t3 = a + b    ← 重复！           t3 = t1       ← 直接复用
+t4 = d * t3                     t4 = d * t1
+```
+
+经典 CSE 算法基于**可用表达式分析**（Available Expressions Analysis），这是一种前向数据流分析。编译器维护一个集合 `AVAIL`，记录在每个程序点上哪些表达式已经被计算且操作数未被修改。当遇到表达式 `e` 时，如果 `e ∈ AVAIL`，则消除重复计算。
+
+#### 为什么在 Inductor 中需要
+
+虽然 FX 图层面已经执行过 CSE，但经过 Lowering（阶段三）和调度（阶段四）之后，IR 的形态发生了变化：
+
+1. **Lowering 引入新的冗余**：高级算子展开为底层 IR 时，可能引入相同的索引计算或加载操作
+2. **融合产生的重复**：多个 SchedulerNode 融合为一个 FusedSchedulerNode 时，不同循环体的相同子表达式需要被合并
+3. **索引计算重复**：多个 `load`/`store` 操作可能共享完全相同的指针偏移计算
+
+如果不进行代码生成阶段的 CSE，生成的 kernel 中会出现大量冗余计算，浪费寄存器和 ALU 资源。
+
+#### 在本模块中的具体体现
+
+Inductor 在 `codegen/common.py` 中实现了 `CSE` 类，作为代码生成阶段的核心优化引擎：
+
+```python
+class CSE:
+    def __init__(self):
+        self._cache = {}           # 表达式字符串 → CSEVariable 映射
+        self.store_cache = {}      # store 操作缓存
+        self.reduction_cache = {}  # reduction 操作缓存
+
+    def generate(self, buffer, expr, *, write=True):
+        if expr in self._cache:
+            var = self._cache[expr]
+            var.use_count += 1
+            return var              # 命中缓存，直接复用
+        var = self.newvar()          # tmp0, tmp1, ...
+        self._cache[expr] = var
+        if write:
+            buffer.writeline(f"auto {var.name} = {expr}")
+        return var
+```
+
+**Triton 后端的 Mask-Aware CSE**：在 GPU 代码生成中，相同的指针偏移但在不同 mask 下的 `tl.load` 是**不等价**的（mask 影响加载语义）。因此 `TritonCSE` 通过 `augment_key()` 将 mask 信息加入缓存键：
+
+```python
+class TritonCSE(CSE):
+    def augment_key(self, cache_key):
+        if mask := V.kernel._load_mask:
+            return (cache_key, mask.name)   # mask 不同 → 不同 key
+        return cache_key
+```
+
+这对应了经典 CSE 理论中"表达式可用性"的概念：mask 不同的 load 不满足"可用"条件。
+
+### 2.3 向量化（Vectorization）
+
+**参考**：Engineering a Compiler 第 9 章 "Loop Optimizations"（循环展开、SIMD 向量化、向量化合法性判断）。
+
+#### 原理
+
+向量化（Vectorization）是将多个标量操作合并为单条 SIMD（Single Instruction Multiple Data）指令的优化技术。一条 SIMD 指令可以同时对多个数据元素执行相同操作：
+
+```
+标量执行（4 次独立操作）：        向量化执行（1 次 SIMD 操作）：
+y[0] = exp(x[0])                 vec_y = vec_exp(vec_x)   ← 同时处理 4/8/16 个元素
+y[1] = exp(x[1])
+y[2] = exp(x[2])
+y[3] = exp(x[3])
+```
+
+向量化需要满足**合法性条件**：
+- **数据对齐**：内存访问应当对齐到向量宽度边界（否则需要使用 `loadu` 非对齐加载）
+- **无跨迭代依赖**：循环迭代之间不能存在写后读（RAW）等数据依赖
+- **步幅规则**：连续步幅（stride=1）的访问最适合向量化；非连续访问需要 gather/scatter 指令
+
+#### 为什么在 Inductor 中需要
+
+现代 CPU 和 GPU 都高度依赖向量化来获得峰值性能：
+
+- **CPU**：AVX2（256-bit，8 个 float32）、AVX-512（512-bit，16 个 float32）——不使用向量化等于浪费 87.5% 的 ALU 能力
+- **GPU**：Triton 的编程模型本身就是向量化的——一个 thread block 中的所有线程并行执行相同操作
+
+在 Inductor 的 CPU 路径中，如果不进行向量化，生成的 C++ kernel 将逐元素处理，性能远低于手写的 ATen 向量化 kernel。
+
+#### 在本模块中的具体体现
+
+**CPU 路径**：`CppVecKernel` 和 `CppVecOverrides` 生成使用 `at::vec::Vectorized<T>` 的向量化代码：
+
+```cpp
+// 标量 CppKernel 生成：
+auto tmp0 = in_ptr0[x0 * s1 + x1];
+auto tmp1 = std::exp(tmp0);
+out_ptr1[x0 * s1 + x1] = tmp1;
+
+// 向量化 CppVecKernel 生成（AVX2, 8 元素）：
+auto tmp0 = at::vec::Vectorized<float>::loadu(&in_ptr0[x0 * s1 + x1], 8);
+auto tmp1 = at::vec::exp(tmp0);                           // 8 个 exp 同时计算
+tmp1.store(&out_ptr1[x0 * s1 + x1], 8);
+```
+
+**向量化策略选择**由 `TilingSelect` 决定——它分析每个维度的步幅模式，判断向量化是否合法且有益：
+
+```
+步幅分析：
+├── stride == 1  → 连续访问，最佳向量化候选
+├── stride == 0  → 广播，标量加载后广播为向量
+└── stride > 1   → 非连续，需要 gather 操作，可能不值得向量化
+```
+
+**GPU 路径**：Triton 编程模型天然向量化。`TritonKernel` 生成的代码中，`tl.load` 和 `tl.store` 操作本身就是向量化的——一个 `tl.load(ptr + xindex, xmask)` 会加载 `XBLOCK` 个元素。向量化粒度由 block size（如 `XBLOCK=512`）决定。
+
+### 2.4 循环展开（Loop Unrolling）
+
+**参考**：Engineering a Compiler 第 9 章 "Loop Optimizations"（循环展开的收益与代价、展开因子选择）。
+
+#### 原理
+
+循环展开（Loop Unrolling）通过复制循环体多次来减少循环控制开销（分支判断、计数器更新），并暴露指令级并行（ILP）机会：
+
+```
+原始循环：                       展开后（factor=4）：
+for (i = 0; i < N; i++) {       for (i = 0; i < N; i += 4) {
+    A[i] = B[i] + C[i];             A[i]   = B[i]   + C[i];
+}                                    A[i+1] = B[i+1] + C[i+1];
+                                     A[i+2] = B[i+2] + C[i+2];
+                                     A[i+3] = B[i+3] + C[i+3];
+                                 }
+```
+
+**收益**：
+- 减少循环分支开销（每次迭代执行更多工作）
+- 增加指令级并行（展开后的独立操作可以重叠执行）
+- 为后续优化（如向量化、寄存器重用）创造条件
+
+**代价**：
+- 代码膨胀（code bloat）——可能超出指令缓存
+- 寄存器压力增加——更多活跃变量需要更多寄存器
+- 需要处理尾部迭代（N 不是展开因子的倍数）
+
+#### 为什么在 Inductor 中需要
+
+在 GPU kernel 中，每个 thread block 处理一个 tile（如 512 个元素），block 内的循环展开直接影响：
+- **指令缓存利用率**：过大的 kernel 代码会降低 I-cache 命中率
+- **寄存器压力**：GPU 的寄存器文件有限，过度展开会导致寄存器溢出（spill），反而降低性能
+
+在 CPU kernel 中，循环展开是向量化的重要前置优化——展开后的多个标量操作可以合并为一条 SIMD 指令。
+
+#### 在本模块中的具体体现
+
+**Triton 后端**：`XBLOCK` 参数决定了每个 thread block 处理的元素数。在代码生成阶段，`TritonKernel` 通过 `tl.arange(0, XBLOCK)` 生成一个向量化范围，本质上等价于将循环展开为 `XBLOCK` 个并行操作。block size 的选择通过 `@triton.heuristics` 的 autotuning 完成——这就是经典的"展开因子选择"问题。
+
+**CPU 后端**：`CppVecKernel` 的向量化本身就是一种隐式展开——将 `tiling_factor`（如 8）个标量迭代合并为一次向量操作。同时，生成的 C++ 代码包含**尾部循环**处理非整数倍剩余元素：
+
+```cpp
+// 主循环：8 元素一组向量化（隐式展开 factor=8）
+for (long x1 = 0; x1 < (s1 & ~(8 - 1)); x1 += 8) {
+    auto tmp0 = at::vec::Vectorized<float>::loadu(&in_ptr0[x0 * s1 + x1], 8);
+    // ...
+}
+// 尾部循环：标量处理剩余元素
+for (long x1 = (s1 & ~(8 - 1)); x1 < s1; x1++) {
+    auto tmp0 = in_ptr0[x0 * s1 + x1];
+    // ...
+}
+```
+
+### 2.5 寄存器分配与内存管理
+
+**参考**：Engineering a Compiler 第 12 章 "Register Allocation"（图着色算法、活跃范围、溢出代码）。
+
+#### 原理
+
+寄存器分配（Register Allocation）是将程序中无限的虚拟寄存器映射到有限的物理寄存器的过程。当虚拟寄存器数量超过物理寄存器数量时，编译器必须插入溢出代码（spill code），将部分寄存器值临时保存到内存。
+
+经典的寄存器分配算法是**图着色**（Graph Coloring）：
+
+```
+Step 1: 活跃分析（Liveness Analysis）
+│  对每个变量，计算其"活跃范围"（从定义点到最后一次使用）
+│
+▼ Step 2: 构建干涉图（Interference Graph）
+│  如果两个变量的活跃范围重叠，则它们不能共享同一寄存器
+│  图中节点 = 变量，边 = 活跃范围重叠（干涉）
+│
+▼ Step 3: 图着色
+│  用 K 种颜色（K = 物理寄存器数）对干涉图着色
+│  同色的节点可共享同一寄存器
+│
+▼ Step 4: 溢出处理
+   如果无法用 K 色完成着色，选择某个变量溢出到内存
+   插入 store（溢出时）和 load（重载时）
+```
+
+溢出（spill）是寄存器分配中最昂贵的操作——访问内存比访问寄存器慢 2-3 个数量级。
+
+#### 为什么在 Inductor 中需要
+
+**GPU 场景**：GPU 每个 SM 的寄存器文件有限（如 NVIDIA A100 每个 SM 65536 个 32-bit 寄存器）。如果每个 thread 使用过多寄存器：
+- 每个 SM 能并发执行的 thread block 数量减少（occupancy 降低）
+- 严重的寄存器溢出会导致数据被存放到 local memory（实际是全局显存），延迟极高
+
+**CPU 场景**：虽然有寄存器重命名等硬件机制，但编译器仍需合理分配寄存器以充分利用 AVX-512 等宽向量寄存器（zmm0-zmm31，共 32 个）。
+
+**内存管理**：代码生成阶段还需要管理张量 buffer 的内存生命周期——分配、复用、释放。这类似于编译器的**栈帧管理**（stack frame management），需要计算每个临时变量的活跃区间并合理分配空间。
+
+#### 在本模块中的具体体现
+
+**GPU 寄存器分配**：Triton 编译器负责将生成的 Triton kernel 中的变量映射到 GPU 寄存器。Inductor 通过以下方式间接影响寄存器压力：
+- **CSE** 减少冗余变量，降低寄存器需求
+- **Block size 选择**（`XBLOCK`）影响每个 thread 的活跃变量数
+- **融合决策**影响单个 kernel 的复杂度和寄存器需求
+
+**内存池化**（`MemoryPlanner`）：Inductor 在 wrapper 层面实现了类似寄存器分配的内存管理。`MemoryPlanner` 的 5 阶段管线本质上是一种"内存版本的寄存器分配"：
+
+```
+寄存器分配                          Inductor 内存池化
+──────────                         ──────────────────
+活跃分析 (Liveness)                 compute_live_ranges()
+│  计算变量的活跃区间                 │  计算每个 buffer 的使用范围
+│                                   │
+干涉图 (Interference)               TemporalSplit / SpatialSplit
+│  活跃范围重叠 → 不能共享寄存器       │  时间重叠 → 空间分区 (SpatialSplit)
+│  时间不重叠 → 可共享寄存器           │  时间不重叠 → 时间共享 (TemporalSplit)
+│                                   │
+溢出 (Spill)                        AllocFromPoolLine
+│  寄存器不够 → 溢出到内存             │  池空间不够 → 分配新池
+```
+
+### 2.6 模板化代码生成 vs 自动化代码生成
+
+**参考**：Engineering a Compiler 第 10 章 "Instruction Selection"（窥孔优化、模板匹配 vs 系统化 lowering）。
+
+#### 原理
+
+编译器的代码生成有两种基本策略：
+
+```
+策略一：模板化代码生成（Template-based / Peephole）
+├── 为已知的常见 IR 模式预先手写目标代码模板
+├── 代码生成时匹配 IR 模式，直接套用模板
+├── 优点：对已知模式可生成最优代码
+├── 缺点：只能处理预定义的模式，灵活性有限
+└── 示例：经典的窥孔优化（peephole optimization）
+
+策略二：自动化代码生成（Systematic / Algorithmic）
+├── 通过通用算法将 IR 系统性地翻译为目标代码
+├── 无需为每个模式预先手写模板
+├── 优点：可处理任意 IR 模式，通用性强
+├── 缺点：对特定模式可能不如手写模板高效
+└── 示例：基于 DAG 覆盖的指令选择算法
+```
+
+实际编译器通常**混合使用**两种策略：对性能关键的常见操作使用模板，对其他操作使用自动化算法。
+
+#### 为什么在 Inductor 中需要
+
+深度学习工作负载中有两类操作：
+
+1. **标准计算密集型操作**（matmul、convolution）：这些操作已有高度优化的库实现（cuBLAS、cuDNN、oneDNN），由专家手工调优了数十年。重新生成这些 kernel 毫无意义——应当直接调用。
+2. **融合操作**（element-wise fusion、reduction fusion）：这些是 Inductor 调度器新创建的组合操作，没有现成的库实现——必须通过自动化代码生成来产生。
+
+如果 Inductor 只有自动化代码生成，它会试图重新发明 cuBLAS；如果只有模板化代码生成，它无法处理调度器创建的任意融合模式。
+
+#### 在本模块中的具体体现
+
+Inductor 混合使用了两种策略：
+
+**模板化路径**——针对已知的高效实现：
+
+```
+ExternKernelSchedulerNode
+│  直接调用外部库（cuBLAS, cuDNN, oneDNN）
+│  → codegen_extern_kernel()
+│  → 生成: at::addmm(arg0, arg1, arg2)  或  torch._C._convolution(...)
+│
+TemplateBuffer
+│  使用预定义的 kernel 模板（mm, conv + epilogue fusion）
+│  → backend.codegen_template()
+│  → 例如 CUTLASS epilogue fusion：conv 模板 + 自定义的 pointwise epilogue
+```
+
+**自动化路径**——针对调度器创建的融合操作：
+
+```
+FusedSchedulerNode / SchedulerNode
+│  通过 V.ops handler 系统性翻译 IR
+│  → backend.codegen_node()
+│  → 安装 V.ops → 执行 inner_fn → 逐操作翻译为目标语言
+│  → 生成自定义的 Triton/C++ kernel
+```
+
+两种路径在同一个调度循环中无缝协作：
+
+```
+Scheduler.codegen()
+│
+├── 遇到 ExternKernel → 模板化（调用 cuBLAS）
+├── 遇到 TemplateBuffer → 模板化（CUTLASS 模板 + epilogue）
+└── 遇到 FusedSchedulerNode → 自动化（V.ops 逐操作翻译）
+```
+
+这种混合策略确保了 Inductor 既能利用高度优化的库实现，又能对融合操作生成定制化的高性能 kernel。
+
+---
+
+## 三、主体核心调用栈
+
+### 3.1 从调度器到最终产物的完整调用链
 
 ```
 graph.py:2546  GraphLowering.codegen()
@@ -115,7 +489,7 @@ graph.py:2546  GraphLowering.codegen()
             └── post_compile()       # CUDA Graph、输入对齐
 ```
 
-### 2.2 Triton Kernel 生成调用链（GPU 路径）
+### 3.2 Triton Kernel 生成调用链（GPU 路径）
 
 ```
 TritonScheduling.codegen_node(node)
@@ -144,7 +518,7 @@ TritonScheduling.codegen_node(node)
             └── kernel_name.run(args, stream=stream0) # wrapper 中的调用行
 ```
 
-### 2.3 C++ Kernel 生成调用链（CPU 路径）
+### 3.3 C++ Kernel 生成调用链（CPU 路径）
 
 ```
 CppScheduling.codegen_node(node)
@@ -175,9 +549,9 @@ CppScheduling.codegen_node(node)
 
 ---
 
-## 三、主体流程梳理
+## 四、主体流程梳理
 
-### 3.1 代码生成整体流程（6 步）
+### 4.1 代码生成整体流程（6 步）
 
 ```
 Step 1: 后端选择
@@ -222,9 +596,9 @@ Step 1: 后端选择
 
 ---
 
-## 四、UML 图 / 架构设计
+## 五、UML 图 / 架构设计
 
-### 4.1 代码生成框架类层次
+### 5.1 代码生成框架类层次
 
 ```
                          ┌─────────────────────────┐
@@ -260,7 +634,7 @@ Step 1: 后端选择
 └────────┘ └────────────┘
 ```
 
-### 4.2 后端注册与调度分派
+### 5.2 后端注册与调度分派
 
 ```
 init_backend_registration() (common.py:491)
@@ -291,7 +665,7 @@ init_backend_registration() (common.py:491)
     └───────────────────────────┘  └──────────────────────
 ```
 
-### 4.3 Wrapper 代码结构
+### 5.3 Wrapper 代码结构
 
 ```
 生成的 Python 源码整体结构
@@ -332,9 +706,9 @@ init_backend_registration() (common.py:491)
 
 ---
 
-## 五、关键思想代码讲解
+## 六、关键思想代码讲解
 
-### 5.1 CSE（公共子表达式消除）——代码生成的核心优化
+### 6.1 CSE（公共子表达式消除）——代码生成的核心优化
 
 **问题**：IR 循环体中，同一个表达式可能被多次计算。例如：
 
@@ -391,7 +765,7 @@ class TritonCSE(CSE):
 
 **为什么 Mask 重要**：在 Triton 中，`tl.load(ptr, mask)` 中的 mask 影响加载语义。两个相同地址但不同 mask 的 load 不是等价的——CSE 必须区分它们。
 
-### 5.2 后端注册机制——策略模式的实现
+### 6.2 后端注册机制——策略模式的实现
 
 **注册 API**（`common.py:400`）：
 
@@ -434,7 +808,7 @@ def init_backend_registration():
 - 调度器通过 `get_scheduling_for_device(device)` 获取策略，无需知道具体后端实现
 - 同一个调度器代码可以驱动所有后端的代码生成
 
-### 5.3 Kernel 基类——代码生成的抽象骨架
+### 6.3 Kernel 基类——代码生成的抽象骨架
 
 **Kernel**（`common.py:2139-2460`）定义了所有后端 kernel 必须实现的接口：
 
@@ -476,7 +850,7 @@ class Kernel(CodeGen):
 
 **关键设计**：`loads`、`compute`、`stores` 三个缓冲区的分离——后端可以先加载所有输入（loads），再执行所有计算（compute），最后存储所有输出（stores）。这种分离使得 Triton 后端可以在 loads 和 stores 中插入 mask 处理，C++ 后端可以分离标量和向量化代码。
 
-### 5.4 TritonKernel——GPU 代码生成的核心
+### 6.4 TritonKernel——GPU 代码生成的核心
 
 **TritonKernel**（`triton.py:2767-6430`）继承 `SIMDKernel` → `Kernel`：
 
@@ -549,7 +923,7 @@ def codegen_kernel(self, name=None):
     return code.getvalue()
 ```
 
-### 5.5 CppKernel——CPU 代码生成的核心
+### 6.5 CppKernel——CPU 代码生成的核心
 
 **CppKernel**（`cpp.py:2000-4106`）生成标量 C++ 代码：
 
@@ -616,7 +990,7 @@ def exp(x):
     return f"at::vec::exp({x})"    # at::vec::exp(tmp0) → 向量化 exp
 ```
 
-### 5.6 OpenMP 并行化——CPU 多线程
+### 6.6 OpenMP 并行化——CPU 多线程
 
 **WorkSharing**（`cpp.py:5690-5740`）管理 OpenMP 并行区域：
 
@@ -671,7 +1045,7 @@ def decide_parallel_depth(self, max_parallel_depth, threads):
     return ParallelDepth(parallel_depth=depth, ...)
 ```
 
-### 5.7 PythonWrapperCodegen——编排内存分配和 Kernel 启动
+### 6.7 PythonWrapperCodegen——编排内存分配和 Kernel 启动
 
 **内存分配**（`wrapper.py:3542-3588`）：
 
@@ -716,9 +1090,9 @@ def _generate(self, is_inference):
 
 ---
 
-## 六、关键源码讲解
+## 七、关键源码讲解
 
-### 6.1 Triton 索引计算——SymPy 到 Triton 指针算术
+### 7.1 Triton 索引计算——SymPy 到 Triton 指针算术
 
 **indexing() 方法**（`triton.py:2987-3450`）是 Triton 代码生成中最复杂的方法，将 SymPy 索引表达式翻译为 Triton 指针算术：
 
@@ -758,7 +1132,7 @@ block_ptr = tl.make_block_ptr(
 tmp0 = tl.load(block_ptr)
 ```
 
-### 6.2 Triton Reduction 的两种策略
+### 7.2 Triton Reduction 的两种策略
 
 论文 Section 4.5 描述了两种 reduction 代码生成策略：
 
@@ -783,7 +1157,7 @@ for roffset in tl.range(0, rnumel, RBLOCK):
     acc = tl.sum(tmp, axis=0)  # 分块累加
 ```
 
-### 6.3 C++ 向量化策略选择
+### 7.3 C++ 向量化策略选择
 
 **TilingSelect**（`cpp.py:3883-4098`）决定是否使用向量化：
 
@@ -822,7 +1196,7 @@ class TilingSelect:
 | 1 个连续维度 | CppVecKernel | 1D 向量化，tiling_factor 元素一组 |
 | 2 个连续维度 | CppTile2DKernel | 2D 分块 + transpose |
 
-### 6.4 内存池化规划——MemoryPlanner 的 5 阶段管线
+### 7.4 内存池化规划——MemoryPlanner 的 5 阶段管线
 
 **MemoryPlanner**（`memory_planning.py:648-816`）：
 
@@ -869,7 +1243,7 @@ SpatialSplit（空间分区）：
 └────────────────────────────────────┘
 ```
 
-### 6.5 CompiledFxGraph——编译产物的封装与管理
+### 7.5 CompiledFxGraph——编译产物的封装与管理
 
 **核心生命周期**（`output_code.py:445-877`）：
 
@@ -909,9 +1283,9 @@ class CompiledFxGraph(OutputCode):
 
 ---
 
-## 七、核心技术
+## 八、核心技术
 
-### 7.1 Triton Kernel 的完整生成流程
+### 8.1 Triton Kernel 的完整生成流程
 
 ```
 IR 循环体（Python 闭包）
@@ -943,7 +1317,7 @@ IR 循环体（Python 闭包）
         └── [stores]                     → tl.store 序列
 ```
 
-### 7.2 生成的 Triton Kernel 示例（论文 Figure 3 实际输出）
+### 8.2 生成的 Triton Kernel 示例（论文 Figure 3 实际输出）
 
 ```python
 @pointwise(size_hints=[...], filename=__file__, ...)
@@ -961,7 +1335,7 @@ def triton_poi_fused_add_relu_0(in_ptr0, in_ptr1, out_ptr2,
     tl.store(out_ptr2 + x0, tmp3, xmask)    # 存储
 ```
 
-### 7.3 生成的 C++ Kernel 示例
+### 8.3 生成的 C++ Kernel 示例
 
 > 以下示例基于 `TORCH_LOGS="inductor"` 实际输出构造，省略了部分边界处理以突出核心结构。
 
@@ -1015,7 +1389,7 @@ extern "C" void cpp_kernel_1(float* in_ptr0, float* out_ptr1,
 }
 ```
 
-### 7.4 内存池化效果
+### 8.4 内存池化效果
 
 **无池化**（每个 buffer 独立分配）：
 
@@ -1041,7 +1415,7 @@ del pool0, buf0, buf1
 # 总分配：1 次 CUDA malloc（减少 50%）
 ```
 
-### 7.5 CUDA Graph 集成
+### 8.5 CUDA Graph 集成
 
 论文 Section 4.7 描述了 CUDA Graph 的集成方式：
 
@@ -1062,7 +1436,7 @@ compiled_graph(inputs) → g.replay()  # 一次性重放所有 kernel
 
 CUDA Graph 将多个 kernel launch 录制为单个 GPU 提交，消除了 Python → CUDA driver 的逐次调用开销。
 
-### 7.6 Kernel 启动参数——Autotuning
+### 8.6 Kernel 启动参数——Autotuning
 
 **Triton 启发式参数**：
 
@@ -1083,7 +1457,7 @@ CUDA Graph 将多个 kernel launch 录制为单个 GPU 提交，消除了 Python
 
 ---
 
-## 八、自主学习 Debug 路线
+## 九、自主学习 Debug 路线
 
 ### Step 1: 观察后端注册和选择
 
@@ -1322,9 +1696,9 @@ f(torch.randn(4, 4))  # CPU
 
 ---
 
-## 九、数据流加工过程重点
+## 十、数据流加工过程重点
 
-### 9.1 从 SchedulerNode 到可执行函数的形态演变
+### 10.1 从 SchedulerNode 到可执行函数的形态演变
 
 ```
 阶段 0: Phase 4 产物（调度器输出）
@@ -1436,7 +1810,7 @@ CompiledFxGraph 对象
    └── 用户直接调用：compiled_graph(inputs) → 结果
 ```
 
-### 9.2 关键转变点分析
+### 10.2 关键转变点分析
 
 **转变 1：IR 闭包 → Kernel 源码（代码翻译）**
 
@@ -1497,7 +1871,7 @@ def call(args):                           CompiledFxGraph(
 └── 序列化/反序列化：支持 FxGraphCache 持久化
 ```
 
-### 9.3 Triton vs C++ 后端数据流对比
+### 10.3 Triton vs C++ 后端数据流对比
 
 ```
                      Triton (GPU)                          C++ (CPU)
@@ -1531,7 +1905,7 @@ CSE                  TritonCSE (mask-aware)                 CSE (dtype-aware)
 
 ---
 
-## 十、交叉校验报告
+## 十一、交叉校验报告
 
 > 校验时间：2026-04-15
 > 校验方法：对比 PyTorch 2 论文 (ASPLOS 2024)、TorchInductor 设计帖 (dev-discuss #747)、PyTorch 源码 (main 分支)

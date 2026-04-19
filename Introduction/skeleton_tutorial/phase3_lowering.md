@@ -75,9 +75,326 @@ def inner_fn_buf0(index):
 
 ---
 
-## 二、主体核心调用栈
+## 二、编译器背景知识
 
-### 2.1 Lowering 在编译管线中的位置
+> 本节从经典编译原理出发，为 Lowering 阶段涉及的核心概念建立理论基础。每个知识点采用"原理 → 为什么在 Inductor 中需要 → 在本模块的具体体现"三层结构讲解。参考教材：*Engineering a Compiler* (Keith D. Cooper & Linda Torczon, 3rd Edition)。
+
+### 2.1 中间表示转换（IR Translation / Lowering）
+
+**参考**：*Engineering a Compiler* Ch.4 "Intermediate Representations"（多层次 IR、SSA 形式）, Ch.5 "Syntax-Directed Translation"
+
+#### 原理
+
+编译器通常不直接将源语言翻译为目标代码，而是经过一个或多个中间表示（IR）层次的逐步转换。这种设计有两大优势：
+
+1. **每个 IR 层次适合不同的分析和优化**：高层次 IR 保留源语言语义（如函数调用、循环结构），便于做与语言特性相关的优化；低层次 IR 暴露底层操作（如寄存器读写、显式循环），便于做与目标机器相关的优化。
+2. **降低编译器的复杂度**：将 N 个源语言 × M 个目标平台的组合爆炸问题，分解为 N 个"源→IR"前端 × M 个"IR→目标"后端，复杂度从 O(N×M) 降为 O(N+M)。
+
+经典编译器（如 LLVM）使用三层 IR：前端 IR（Clang AST）→ 中间 IR（LLVM IR）→ 机器 IR（MachineInstr）。每一层 lowering 都伴随着信息丢失和结构重组。
+
+```
+高层次 IR                          低层次 IR
+┌─────────────────┐               ┌─────────────────┐
+│ 语义丰富         │  ──Lowering──▶ │ 语义精简         │
+│ 操作粒度粗       │               │ 操作粒度细       │
+│ 优化空间小       │               │ 优化空间大       │
+│ 接近源语言       │               │ 接近目标机器     │
+└─────────────────┘               └─────────────────┘
+```
+
+#### 为什么在 Inductor 中需要
+
+FX Graph 是一个面向 Python 语义的高层次 IR：它的节点是 ATen 算子（如 `aten.convolution`、`aten.addmm`），粒度粗、语义丰富。然而，后端代码生成器（Triton kernel、C++ loop）需要的是循环级操作——从 buffer 的哪个位置 load 数据、做什么计算、store 回哪个位置。FX Graph 和代码生成之间横亘着一个巨大的抽象鸿沟：
+
+- FX Graph 不知道循环结构（它的节点是对整个张量的操作）
+- FX Graph 不知道内存访问模式（它的节点是逻辑语义，不涉及物理布局）
+- FX Graph 不知道后端差异（同一个 ATen 算子在 Triton 和 C++ 后端需要不同的实现策略）
+
+因此，Inductor 必须执行 lowering，将 ATen 粒度的操作翻译为循环粒度的 IR。
+
+#### 在本模块的具体体现
+
+Inductor 的 Lowering 将 FX Graph 的每个 `call_function` 节点翻译为 Inductor IR 节点：
+
+```
+FX Graph Node: aten.add(a, b)
+    │  GraphLowering.call_function() 查 lowerings 注册表
+    │  → make_pointwise(ops_wrapper("add"))
+    ▼
+Inductor IR: Pointwise(inner_fn, ranges)
+    ├── inner_fn = lambda idx: ops.add(a_loader(idx), b_loader(idx))
+    └── ranges = [s0, s1]  # 符号形状
+```
+
+翻译后的 IR 暴露了循环结构（`inner_fn` 描述每个索引处的计算）和内存访问模式（`loader` 描述如何从 buffer 读取数据），为后续的调度、融合和代码生成提供了充分的优化空间。
+
+### 2.2 静态单赋值（SSA）形式
+
+**参考**：*Engineering a Compiler* Ch.4 "Intermediate Representations"（SSA 构造、支配性、φ 函数）
+
+#### 原理
+
+静态单赋值（Static Single Assignment, SSA）是编译器中一种关键的 IR 性质：**每个变量只被赋值一次**。如果原始代码中同一个变量被多次赋值，SSA 构造算法会为每次赋值创建一个新的版本（用下标区分），并在控制流汇合处插入 φ（phi）函数来合并不同路径的值。
+
+```
+原始代码：                    SSA 形式：
+x = 1                         x₁ = 1
+x = 2                         x₂ = 2
+y = x + 1                     y₁ = φ(x₁, x₂) + 1
+```
+
+SSA 的核心价值在于它使得数据流分析变得简单而精确：
+
+- **定义-使用链（def-use chain）**：每个定义只有一个使用点列表，分析时无需追踪"这个变量在哪些地方被修改"
+- **优化更强大**：常量传播、死代码消除、值编号等优化在 SSA 上更容易实现且更精确
+- **并行化友好**：没有写-写冲突，使得操作重排序更安全
+
+#### 为什么在 Inductor 中需要
+
+Lowering 产出的 IR 必须支持精确的数据流分析，因为后续的调度和融合阶段需要知道：
+
+- 每个计算结果被谁消费（决定是否能融合）
+- 每个输入来自哪个生产者（决定依赖关系）
+- 是否存在重计算（决定 Inlining vs. realize 的决策）
+
+如果 IR 允许同一变量被多次覆盖，这些分析将变得复杂且容易出错。
+
+#### 在本模块的具体体现
+
+Inductor 的 IR 天然具有 SSA 性质——每个 `IRNode`（确切地说，每个 `Pointwise`、`Reduction` 等计算节点）都是一个**单定义**的计算单元：
+
+```python
+# 每个 TensorBox 包装一个唯一的 IRNode
+# "x + y" 产生一个新的 TensorBox，不会覆盖任何已有变量
+add_result = TensorBox(StorageBox(Pointwise(inner_fn=add_inner_fn, ranges=[N])))
+# "relu(result)" 产生另一个新的 TensorBox
+relu_result = TensorBox(StorageBox(Pointwise(inner_fn=relu_inner_fn, ranges=[N])))
+```
+
+`TensorBox` → `StorageBox` → `Loops` 的包装链进一步保证了 SSA 性质：每个 `TensorBox` 持有唯一的 `StorageBox`，每个 `StorageBox` 持有唯一的 `Loops` 实例。不存在多个计算共享同一个存储位置的情况（除非通过显式的 View 机制）。
+
+注意：Inductor 的 IR 并非严格意义上的教科书 SSA——它没有显式的 φ 节点。这是因为 IR 是按数据流顺序（拓扑序）构建的，控制流汇合点通过 GraphLowering 的线性解释器语义隐式处理。
+
+### 2.3 定义即运行（Define-by-Run）IR 设计
+
+#### 原理
+
+深度学习框架有两种根本性的计算图构建范式：
+
+| 范式 | 代表 | 图构建时机 | 图执行时机 |
+|------|------|-----------|-----------|
+| **Define-and-Run**（静态图） | TensorFlow 1.x, ONNX | 先构建完整图，再执行 | 图构建完毕后统一执行 |
+| **Define-by-Run**（动态图） | PyTorch eager, Chainer | 边执行边构建 | 构建即执行 |
+
+Define-and-Run 的优势是图构建完毕后可以做全局优化，但代价是调试困难、控制流不灵活（需要 tf.cond 等特殊原语）。Define-by-Run 的优势是自然支持 Python 控制流（if/for/while）、调试友好（可以随时 print），但代价是缺乏全局视图、难以做跨算子优化。
+
+Inductor 的设计目标是在 Define-by-Run 的框架内实现 Define-and-Run 的优化能力。
+
+#### 为什么在 Inductor 中需要
+
+PyTorch 的 eager 模式是 Define-by-Run 的：用户代码逐行执行，每行立即产生计算结果。Inductor 作为 PyTorch 的编译后端，必须保持这一语义——用户通过 `torch.compile` 编译后的代码行为必须与 eager 模式一致。
+
+但编译器需要一个全局的计算图来做优化。Inductor 的解决方案是：在 Lowering 阶段使用 Define-by-Run 的方式构建 IR，但 IR 本身是延迟求值的——**构建时不执行计算，而是记录计算描述**。这样既保持了 Define-by-Run 的语义一致性，又获得了全局优化的能力。
+
+#### 在本模块的具体体现
+
+Inductor IR 的核心数据结构 `inner_fn` 是一个 Define-by-Run 的 Python 闭包：
+
+```python
+# inner_fn 是一个可调用的 Python 函数，但它不会真正执行计算
+def inner_fn_buf0(index):
+    i0, i1 = index
+    tmp0 = ops.load("arg0_1", i0 * s1 + i1)    # 记录 load 操作
+    tmp1 = ops.log(tmp0)                          # 记录 log 操作
+    tmp2 = ops.constant(1.4426950408889634, torch.float32)
+    tmp3 = ops.mul(tmp1, tmp2)                    # 记录 mul 操作
+    return tmp3
+```
+
+这里的 `ops.load`、`ops.log`、`ops.mul` 并非真正的数值计算——它们通过 `V.ops` 虚拟化接口分发。在 Lowering 阶段，`V.ops` 的默认 handler（`MockHandler`）让这些调用返回占位字符串；在代码生成阶段，替换为代码输出 handler；在依赖分析阶段，替换为读写记录 handler。
+
+```
+               inner_fn（同一个闭包）
+                    │
+        ┌───────────┼───────────┐
+        │           │           │
+   V.ops =        V.ops =     V.ops =
+   MockHandler   CodeGenHandler  RecordLoadStore
+        │           │           │
+   返回占位符     生成代码      记录依赖
+   (Lowering时)  (代码生成时)  (依赖分析时)
+```
+
+这种设计使得 Inductor 在保持 Define-by-Run 语义的同时，获得了延迟求值和多阶段解释的能力。
+
+### 2.4 指令选择（Instruction Selection）
+
+**参考**：*Engineering a Compiler* Ch.10 "Instruction Selection"（树匹配、DAG 覆盖）
+
+#### 原理
+
+指令选择是编译器后端的核心任务之一：确定用哪些目标机器指令来实现每个 IR 操作。这是一个复杂的映射问题，因为：
+
+1. **一对多**：一个 IR 操作可能对应多条机器指令。例如，IR 中的 `a * b + c` 可能映射为一条 FMA（融合乘加）指令，也可能映射为一条 MUL 加一条 ADD。
+2. **多对一**：多条 IR 操作可能被合并为一条机器指令。例如，`load + load + add + store` 可能被合并为一条内存-内存加法指令。
+3. **代价不等**：不同选择的执行代价不同。FMA 比分开的 MUL+ADD 更快，但并非所有硬件都支持 FMA。
+
+经典指令选择算法包括：树模式匹配（tree pattern matching）、DAG 覆盖（DAG covering）和语法制导翻译（syntax-directed translation）。
+
+```
+IR 操作树：              指令选择结果（两种方案）：
+
+    add                  方案 A：FMA (快)
+   / | \                 ├── fma c, a, b → r1
+  c   mul               └── mov r1 → dst
+     / |
+    a   b
+                        方案 B：MUL + ADD (通用)
+                        ├── mul a, b → r1
+                        ├── add r1, c → r2
+                        └── mov r2 → dst
+```
+
+#### 为什么在 Inductor 中需要
+
+Inductor 面临的指令选择问题有其特殊性：每个 PyTorch 算子可以根据 **dtype、device、layout、后端** 的不同组合，被翻译为不同的底层实现：
+
+- `aten.add`：在 CPU 后端翻译为 C++ 循环中的 `+` 运算符；在 Triton 后端翻译为 `tl.where` 或 `tl.load + tl.add`
+- `aten.mm`：在 GPU 上可能翻译为 Triton mm template（分块矩阵乘法）、cuBLAS 调用或 CUTLASS 调用；在 CPU 上翻译为 oneDNN 调用
+- `aten.relu`：翻译为 `max(x, 0)` 或条件赋值，取决于后端和数据类型
+
+这些选择不能在 FX Graph 层完成（因为那时还不知道后端），必须在 Lowering 阶段根据上下文做出决策。
+
+#### 在本模块的具体体现
+
+Inductor 的指令选择通过 `V.ops` 虚拟化系统和 `lowerings` 注册表共同实现：
+
+1. **`lowerings` 注册表**实现粗粒度的指令选择——它为每个 ATen 算子注册"如何翻译为 IR"的函数。不同的算子走不同的翻译路径：
+
+```python
+# add → make_pointwise（逐元素）
+lowerings[aten.add] = make_pointwise(ops_wrapper("add"))
+
+# sum → make_reduction（归约）
+lowerings[aten.sum] = make_reduction("sum")
+
+# convolution → FallbackKernel（外部库调用）
+make_fallback(aten.convolution)
+```
+
+2. **`V.ops` 虚拟化**实现细粒度的指令选择——同一个 `ops.add(a, b)` 在不同后端有不同的实现。在 Triton 后端，`ops.add` 生成 `tl.add` 代码；在 C++ 后端，生成 `tmp = a + b` 代码。
+
+```
+aten.add(a, b)
+    │ lowerings[aten.add] → make_pointwise
+    │
+    ▼ inner_fn = lambda idx: ops.add(a_loader(idx), b_loader(idx))
+    │
+    ├── Triton 后端: ops.add → "tl.load(...) + tl.load(...)"
+    ├── C++ 后端:    ops.add → "tmp0 + tmp1"
+    └── 分析模式:    ops.add → 记录 dtype 和依赖
+```
+
+### 2.5 数据类型推导与 Shape 推导（Type Inference & Shape Propagation）
+
+**参考**：*Engineering a Compiler* Ch.4 "Intermediate Representations"（类型信息传播）, Ch.5 "Syntax-Directed Translation"（IR 中的类型检查）
+
+#### 原理
+
+在编译器中，类型信息和形状信息需要在整个 IR 中传播。这不仅仅是一个"检查类型是否正确"的工作——正确的类型传播是代码生成的必要前提：
+
+- **内存分配**：编译器需要知道每个变量的大小（shape）和元素类型（dtype）才能分配正确的存储空间
+- **循环边界**：循环的迭代次数由张量的维度大小决定
+- **类型安全**：不同 dtype 的运算需要不同的机器指令（float32 加法和 int64 加法是不同的指令）
+
+传统编译器通过语法制导翻译（syntax-directed translation）在 AST 遍历过程中传播类型信息：每个 AST 节点的类型由其子节点的类型和语言规则决定。
+
+```
+表达式树：          类型传播过程：
+
+    + (float32)      1. x: float32, y: float32  （叶节点类型已知）
+   / \               2. float32 + float32 → float32  （类型规则）
+  x     y            3. 结果类型: float32
+```
+
+#### 为什么在 Inductor 中需要
+
+Lowering 后的 IR 节点需要显式的 shape 和 dtype 信息，原因如下：
+
+1. **内存分配**：每个 `ComputedBuffer` 需要精确的大小和元素类型来分配存储空间
+2. **循环生成**：`Pointwise` 的 `ranges` 决定了生成代码中循环的迭代次数；`Reduction` 的 `reduction_ranges` 决定了归约循环的范围
+3. **类型提升**：`float16 + int32` 的结果类型是什么？Lowering 必须正确处理类型提升规则
+4. **动态形状**：PyTorch 支持动态形状（如 `[batch, seq_len, hidden]` 中 `seq_len` 在运行时才确定），shape 信息必须用符号表示
+
+没有准确的 shape/dtype 信息，后续的代码生成将无法正确分配 buffer 和生成循环。
+
+#### 在本模块的具体体现
+
+Inductor 通过 `TensorBox`、`StorageBox` 和 `Layout` 类在整个 Lowering 过程中追踪和传播 shape/dtype 信息：
+
+```
+TensorBox                          ← 张量容器，提供 get_size() / get_dtype() 接口
+└── StorageBox                     ← 存储容器，代理底层数据的元信息
+    └── Loops (Pointwise/Reduction) ← 计算节点，持有 ranges 和 dtype
+        ├── ranges: Sequence[Expr]  ← SymPy 符号表达式（如 [s0, s1]）
+        └── dtype: torch.dtype     ← 元素类型（如 torch.float32）
+```
+
+**Shape 推导的符号化实现**：
+
+```python
+# 输入张量 x 的形状为 [s0, s1]（s0, s1 是 SymPy 变量）
+x = TensorBox(StorageBox(InputBuffer(name="x", layout=FixedLayout(
+    device=torch.device("cpu"),
+    dtype=torch.float32,
+    size=[s0, s1],        # 符号形状
+    strides=[s1, 1],      # 符号 stride
+))))
+
+# x + y 的 shape 推导：broadcast_symbolic_shapes([s0, s1], [1, s1]) → [s0, s1]
+# 结果 TensorBox 的 get_size() 返回 [s0, s1]
+add_result = make_pointwise(ops_wrapper("add"))(x, y)
+```
+
+**dtype 推导的实现**：
+
+Lowering 注册表中的类型提升规则确保 dtype 正确传播：
+
+```python
+@register_lowering([aten.add], broadcast=True)
+def mul(a, b):
+    # 类型提升：float16 + float32 → float32
+    # TensorBox.get_dtype() 返回提升后的类型
+    fn = ops_wrapper(aten.mul.__name__)
+    return make_pointwise(fn)(a, b)
+```
+
+此外，`DtypePropagationOpsHandler`（在 V.ops 切换到该 handler 时）会遍历整个 `inner_fn` 闭包，通过模拟执行来推断中间结果的 dtype，确保类型一致性。
+
+**Shape 和 dtype 传播的完整流程**：
+
+```
+placeholder 翻译
+├── 提取示例张量的 shape/dtype
+├── 符号化：static_sizes_strides() → SymPy 变量
+└── 创建 InputBuffer(FixedLayout(dtype, size=[s0, s1]))
+
+call_function 翻译（逐节点）
+├── make_pointwise: 输出 shape = broadcast(输入 shapes)
+│                    输出 dtype = type_promote(输入 dtypes)
+├── make_reduction: 输出 shape = 移除归约维度后的 shape
+│                    输出 dtype = override_return_dtype 或类型提升结果
+└── make_fallback:   shape/dtype 由 FakeTensor 推断
+
+finalize
+└── FlexibleLayout 冻结为 FixedLayout（确定 stride）
+```
+
+---
+
+## 三、主体核心调用栈
+
+### 3.1 Lowering 在编译管线中的位置
 
 ```
 compile_fx.py:1473  GraphLowering(gm, example_inputs, ...)
@@ -140,7 +457,7 @@ compile_fx.py:1503-1508
             └── 返回 CompiledFxGraph
 ```
 
-### 2.2 call_function 核心调度栈
+### 3.2 call_function 核心调度栈
 
 ```
 graph.py:1319  call_function(target, args, kwargs)
@@ -174,9 +491,9 @@ graph.py:1319  call_function(target, args, kwargs)
 
 ---
 
-## 三、主体流程梳理
+## 四、主体流程梳理
 
-### 3.1 数据流加工：FX Graph → Inductor IR
+### 4.1 数据流加工：FX Graph → Inductor IR
 
 #### 原始材料
 - **输入**：经过三阶段 FX 优化（Phase 2）后的 FX GraphModule
@@ -369,9 +686,9 @@ graph.py:1547  output() + graph.py:1655  finalize()
 
 ---
 
-## 四、UML 图 / 架构设计
+## 五、UML 图 / 架构设计
 
-### 4.1 Lowering 系统总架构
+### 5.1 Lowering 系统总架构
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -455,7 +772,7 @@ graph.py:1547  output() + graph.py:1655  finalize()
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-### 4.2 Lowering 注册与执行 UML
+### 5.2 Lowering 注册与执行 UML
 
 ```
                     ┌────────────────────────────────┐
@@ -499,7 +816,7 @@ graph.py:1547  output() + graph.py:1655  finalize()
      └──────────────────────────────────────────────────────┘
 ```
 
-### 4.3 延迟求值包装层次
+### 5.3 延迟求值包装层次
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -531,7 +848,7 @@ StorageBox.realize()                 ← 触发物化
   → ComputedBuffer 注册到 graph.buffers 和 graph.operations
 ```
 
-### 4.4 V.ops 虚拟化系统架构
+### 5.4 V.ops 虚拟化系统架构
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -582,9 +899,9 @@ StorageBox.realize()                 ← 触发物化
 
 ---
 
-## 五、关键思想代码讲解
+## 六、关键思想代码讲解
 
-### 5.1 make_pointwise —— 最常用的 Lowering 模式
+### 6.1 make_pointwise —— 最常用的 Lowering 模式
 
 **文件**：[lowering.py:668-770](torch/_inductor/lowering.py#L668)
 
@@ -649,7 +966,7 @@ register_pointwise(aten.add)
     → register_lowering(aten.add)(inner)  → 注册到 lowerings 字典
 ```
 
-### 5.2 make_reduction —— 归约算子的 Lowering
+### 6.2 make_reduction —— 归约算子的 Lowering
 
 **文件**：[lowering.py:6644-6671](torch/_inductor/lowering.py#L6644)
 
@@ -702,7 +1019,7 @@ def create(cls, device, dst_dtype, src_dtype, inner_fn,
 
 归约改变了张量的形状（如 `[B, N, D] → [B, D]`），这意味着它的输出需要一个新的、更小的 buffer。与 pointwise 不同，归约不能简单地通过闭包组合——它需要独立的存储空间。因此 `result.realize()` 将其物化为 `ComputedBuffer`。
 
-### 5.3 make_fallback —— 复杂算子的 Lowering
+### 6.3 make_fallback —— 复杂算子的 Lowering
 
 **文件**：[lowering.py:2506-2561](torch/_inductor/lowering.py#L2506)
 
@@ -758,7 +1075,7 @@ def fallback_handler(kernel, add_to_fallback_set=True):
 - `aten.convolution` — 卷积（cuDNN / oneDNN）
 - `aten.scaled_dot_product_attention` — SDPA（Flash Attention / Memory Efficient Attention）
 
-### 5.4 ops_wrapper —— V.ops 的字符串桥接
+### 6.4 ops_wrapper —— V.ops 的字符串桥接
 
 **文件**：[ir.py](torch/_inductor/ir.py)（定义）
 
@@ -787,9 +1104,9 @@ result = make_pointwise(fn)   # fn 被嵌入 inner_fn 闭包
 
 ---
 
-## 六、关键源码讲解
+## 七、关键源码讲解
 
-### 6.1 GraphLowering.call_function —— Lowering 的调度枢纽
+### 7.1 GraphLowering.call_function —— Lowering 的调度枢纽
 
 **文件**：[graph.py:1319-1476](torch/_inductor/graph.py#L1319)
 
@@ -854,7 +1171,7 @@ def call_function(self, target, args, kwargs):
 2. **缺失算子策略**：不是所有 ATen 算子都有显式 lowering。`FALLBACK_ALLOW_LIST` 中的算子自动转为 fallback；`config.implicit_fallbacks` 允许更宽松的策略。
 3. **布局约束**：某些算子要求输入是 contiguous 或特定布局。`constrain_to_fake_tensors()` 通过比较 FakeTensor 的形状/stride 来确保 IR 节点满足约束。
 
-### 6.2 GraphLowering.run_node —— Inlining 决策中心
+### 7.2 GraphLowering.run_node —— Inlining 决策中心
 
 **文件**：[graph.py:1774-2186](torch/_inductor/graph.py#L1774)
 
@@ -918,7 +1235,7 @@ def run_node(self, n):
 | 流边界不同 | realize | 防止跨 stream Inlining |
 | **其他情况** | **不 realize** | **保持 Inlining，允许后续融合** |
 
-### 6.3 StorageBox.realize() —— 延迟求值的物化
+### 7.3 StorageBox.realize() —— 延迟求值的物化
 
 **文件**：[ir.py:9443-9470](torch/_inductor/ir.py#L9443)
 
@@ -970,7 +1287,7 @@ def realize(self) -> str | None:
   → Pointwise 保留在 data 字段，用于代码生成
 ```
 
-### 6.4 GraphLowering.placeholder —— 输入节点翻译
+### 7.4 GraphLowering.placeholder —— 输入节点翻译
 
 **文件**：[graph.py:1209-1316](torch/_inductor/graph.py#L1209)
 
@@ -1022,7 +1339,7 @@ def placeholder(self, target, args, kwargs):
 - 符号形状通过 `symbolic_sizes_strides()` 提取 SymPy 变量（如 `s0`, `s1`）
 - `DonatedBuffer` 用于 backward 图中可复用的输入（in-place 优化）
 
-### 6.5 分解表的选择与传递
+### 7.5 分解表的选择与传递
 
 **文件**：[decomposition.py:964-973](torch/_inductor/decomposition.py#L964)
 
@@ -1055,7 +1372,7 @@ def make_fallback(op, ...):
 
 **设计哲学**：分解 > 自定义 Lowering > Fallback。如果算子有分解规则，优先使用分解（让分解后的基础算子走标准 lowering），除非显式 `override_decomp=True`。
 
-### 6.6 具体算子 Lowering 示例
+### 7.6 具体算子 Lowering 示例
 
 **简单算子——mul**（lowering.py:7001-7008）：
 
@@ -1133,9 +1450,9 @@ def addmm(self, mat1, mat2, out_dtype=None, beta=1, alpha=1):
 
 ---
 
-## 七、核心技术
+## 八、核心技术
 
-### 7.1 延迟求值与 Inlining 的实现机制
+### 8.1 延迟求值与 Inlining 的实现机制
 
 延迟求值是 Inductor 性能优化的基石。具体实现通过三层包装：
 
@@ -1173,7 +1490,7 @@ relu_result = TensorBox(StorageBox(Pointwise(inner_fn=relu_inner_fn, ranges=[N])
 
 `Pointwise.make_loader()`（ir.py:1106）直接返回 `self.inner_fn`——不创建任何新的 buffer。消费者获取到的是生产者的计算函数，可以组合到自己的 inner_fn 中。
 
-### 7.2 FlexibleLayout vs FixedLayout 的设计
+### 8.2 FlexibleLayout vs FixedLayout 的设计
 
 **文件**：[ir.py:4137-4554](torch/_inductor/ir.py#L4137)
 
@@ -1196,7 +1513,7 @@ FlexibleLayout（可优化）：
 
 **设计意图**：FlexibleLayout 允许调度器在看到完整的 IR 图后，再决定每个中间 buffer 的最优布局。例如，如果消费者偏好 channels-last，生产者可以被冻结为 channels-last，从而避免额外的 transpose。
 
-### 7.3 View 操作的零拷贝实现
+### 8.3 View 操作的零拷贝实现
 
 **文件**：[ir.py:2878-3600](torch/_inductor/ir.py#L2878)
 
@@ -1242,7 +1559,7 @@ def create(cls, x, new_size):
     return ExpandView(data=x, size=new_size)
 ```
 
-### 7.4 Reduction 的多层优化
+### 8.4 Reduction 的多层优化
 
 **文件**：[ir.py:1541-1740](torch/_inductor/ir.py#L1541)
 
@@ -1256,7 +1573,7 @@ def create(cls, x, new_size):
 | 大 | 标准 Reduction | 需要归约循环 |
 | 非常大 | 多层 Reduction | 并行归约：第一层部分归约，第二层最终归约 |
 
-### 7.5 broadcast 的符号化实现
+### 8.5 broadcast 的符号化实现
 
 **文件**：[lowering.py:549-572](torch/_inductor/lowering.py#L549)
 
@@ -1288,7 +1605,7 @@ def broadcast_symbolic_shapes(a, b):
 
 ---
 
-## 八、自主学习 Debug 路线
+## 九、自主学习 Debug 路线
 
 ### 路线总览
 
@@ -1522,9 +1839,9 @@ result = test_decomp_interact(x)
 
 ---
 
-## 九、数据流加工过程重点
+## 十、数据流加工过程重点
 
-### 9.1 FX Graph 在 Lowering 过程中的形态演变
+### 10.1 FX Graph 在 Lowering 过程中的形态演变
 
 ```
 阶段 0: 优化后的 FX Graph（来自 Phase 2）
@@ -1598,7 +1915,7 @@ result = test_decomp_interact(x)
    └── 准备送入调度与融合阶段（Phase 4）
 ```
 
-### 9.2 关键转变点分析
+### 10.2 关键转变点分析
 
 **转变 1：ATen 算子 → define-by-run 闭包**
 
@@ -1647,7 +1964,7 @@ FlexibleLayout（可优化）：            FixedLayout（不可变）：
 └── 最终在 finalize() 或调度器中冻结
 ```
 
-### 9.3 每种 Lowering 路径的数据流对比
+### 10.3 每种 Lowering 路径的数据流对比
 
 ```
                     输入                       加工                         输出
@@ -1673,7 +1990,7 @@ Fallback      TensorBox args             make_fallback(op)             TensorBox
 
 ---
 
-## 十、交叉校验报告
+## 十一、交叉校验报告
 
 > 校验时间：2026-04-15
 > 校验方法：对比 PyTorch 2 论文 (ASPLOS 2024)、TorchInductor 设计帖 (dev-discuss #747)、PyTorch 源码 (main 分支)

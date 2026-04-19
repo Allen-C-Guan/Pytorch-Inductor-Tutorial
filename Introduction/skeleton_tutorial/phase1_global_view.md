@@ -199,9 +199,337 @@ def inner_fn_buf0(index):
 
 ---
 
-## 三、编译管线主体流程梳理
+## 三、编译器背景知识
 
-### 3.1 全景数据流与数据加工过程
+> **定位**：在深入 Inductor 管线的具体实现之前，我们需要先建立编译器设计的一般性理论基础。本节将经典编译理论的核心概念与 Inductor 的工程实践逐层对应，帮助你从"知道它在做什么"跃迁到"理解它为什么这么做"。每个知识点遵循**原理 → 为什么在 Inductor 中需要 → 在本模块的具体体现**三层结构。
+>
+> **教材参考**：Keith D. Cooper & Linda Torczon, *Engineering a Compiler*, 3rd Edition (以下简称 EaC3e)
+
+### 3.1 编译器流水线概述（Compiler Pipeline Overview）
+
+**参考**：EaC3e Ch.4 "Intermediate Representations"，Ch.7 "The Back End"
+
+#### 原理
+
+经典编译器将源语言到目标代码的翻译过程分解为多个串连的阶段（pass），每个阶段负责一种独立的变换。典型的多遍编译架构为：
+
+```
+源代码
+  │
+  ▼ [前端 Front End]
+词法分析 → 语法分析 → 语义分析
+  │  产出：抽象语法树 (AST) + 符号表
+  │
+  ▼ [中间表示 IR 层]
+IR 生成 → IR 优化（多轮 Pass）
+  │  产出：优化后的 IR
+  │
+  ▼ [后端 Back End]
+指令选择 → 寄存器分配 → 指令调度
+  │  产出：目标机器代码
+  │
+  ▼ [代码生成 Code Generation]
+汇编 / 二进制输出
+```
+
+这种**关注点分离**（separation of concerns）的设计带来三大好处：
+1. **模块化**：每个阶段可独立设计、测试和替换
+2. **可复用性**：同一前端可对接不同后端（如 N 种语言 → M 种架构，只需 N+M 个模块而非 N×M）
+3. **优化空间**：多遍架构允许在不同抽象层次上应用不同粒度的优化
+
+#### 为什么在 Inductor 中需要
+
+PyTorch 的用户代码是 Python——一种高度动态的解释型语言。要让深度学习工作负载在 GPU/CPU 上高效执行，Inductor 必须完成从"Python 动态语义"到"硬件特化 kernel"的跨越。这不是一个简单的翻译，而是一个**完整的编译过程**：
+
+- **前端问题**：如何从 Python 的 define-by-run 模型中提取静态计算图？
+- **IR 问题**：用什么中间表示来表达张量计算，使其既保留语义又便于分析和变换？
+- **优化问题**：如何系统性地消除冗余、融合操作、优化内存访问？
+- **后端问题**：如何将优化后的计算描述映射到 Triton（GPU）/ C++（CPU）等具体执行环境？
+
+每一个问题都对应经典编译器流水线中的一个阶段。
+
+#### 在本模块的具体体现
+
+Inductor 的完整编译管线与经典编译器的对应关系如下：
+
+```
+经典编译器                          Inductor
+──────────                         ──────────
+前端 (Front End)                ←→ torch._dynamo
+  源代码 → AST                   ←→ Python 字节码 → FX Graph
+  语义分析                       ←→ Guard 条件推断
+
+IR 生成                          ←→ GraphLowering.run()
+  AST → IR                       ←→ FX Node → Inductor IR (TensorBox/Buffer/Pointwise)
+
+IR 优化 (多轮 Pass)              ←→ FX 优化 Pass + 调度优化
+  常量折叠 / 死代码消除           ←→ _recursive_post_grad_passes
+  循环优化 / 内联                ←→ Inlining + Fusion
+  数据流分析                     ←→ 依赖分析 (dependencies.py)
+
+后端 (Back End)                  ←→ Scheduler + codegen
+  指令选择                       ←→ Triton/C++ kernel 模板选择
+  寄存器分配                     ←→ GPU 寄存器分配 (Triton 自身处理)
+  指令调度                       ←→ 节点拓扑排序 + 融合决策
+
+代码生成                         ←→ codegen/triton.py, codegen/cpp.py
+  汇编输出                       ←→ Triton kernel 源码 / C++ 源码
+  链接                           ←→ 编译为 .so / JIT 编译
+```
+
+> **关键差异**：传统编译器的后端输出汇编/机器码，Inductor 的后端输出 **Triton Python / C++ 源码**——然后由 Triton 编译器或 C++ 编译器完成最终的机器码生成。这意味着 Inductor 本质上是一个**源到源翻译器**（source-to-source translator），利用 Triton 和 C++ 编译器作为"底层代码生成器"。
+
+---
+
+### 3.2 中间表示（IR）设计
+
+**参考**：EaC3e Ch.4 "Intermediate Representations"（§4.1–§4.6）
+
+#### 原理
+
+中间表示是编译器的核心数据结构——它是前端语义与后端实现之间的桥梁。EaC3e §4.1 指出，一个好的 IR 需要在三个维度上取得平衡：
+
+| 维度 | 一端 | 另一端 |
+|------|------|--------|
+| **抽象层次** | 接近源语言（高层 IR） | 接近机器码（低层 IR） |
+| **表示形式** | 图结构（CFG、数据流图） | 线性结构（三地址码、SSA） |
+| **依赖信息** | 显式（独立 IR 节点间边） | 隐式（变量名引用） |
+
+经典编译器通常使用**多层 IR**：前端使用高层 IR（如 AST/Clang AST），中端使用与语言无关的 IR（如 LLVM IR），后端使用低层 IR（如 MachineInstr）。每一层 IR 都为特定类型的优化服务：
+
+```
+AST              →  高层结构优化（如循环变换需要知道循环结构）
+  │
+  ▼
+LLVM IR (SSA)    →  数据流优化（SSA 形式使 def-use 链显式化）
+  │
+  ▼
+MachineInstr     →  指令级优化（指令调度、寄存器分配）
+```
+
+#### 为什么在 Inductor 中需要
+
+Inductor 面临的核心挑战是：**输入是 Python 级别的张量算子，输出是硬件级别的并行 kernel**。这两者之间的语义鸿沟巨大——需要一种 IR 来：
+
+1. **保留张量计算语义**：操作对象是多维张量而非标量，需要表达形状（shape）、步长（stride）、数据类型（dtype）
+2. **支持优化分析**：IR 需要暴露足够的信息让优化 Pass 分析数据依赖、内存访问模式、融合机会
+3. **桥接多后端**：同一 IR 需要能被翻译为 Triton kernel（GPU）和 C++ kernel（CPU）
+4. **容纳动态性**：张量大小可能是符号变量（如 batch_size），IR 必须在符号层面可分析
+
+#### 在本模块的具体体现
+
+Inductor 使用了**三层 IR**，各自服务于不同的编译阶段：
+
+```
+Layer 1: FX Graph IR (torch.fx)
+│  形态：Python 计算图，节点是 aten 算子调用
+│  用途：前端产出，表示用户意图
+│  对应：GraphModule + Node 对象
+│  示例：%add = call_function[target=aten.add](%x, %y)
+│
+▼
+Layer 2: Inductor IR (torch/_inductor/ir.py)
+│  形态：延迟求值的计算 DAG，节点是 Pointwise/Reduction/ExternKernel
+│  用途：中端优化，支持 Inlining、布局变换、融合分析
+│  对应：TensorBox → StorageBox → Buffer/Loops 继承层次
+│  示例：Pointwise(inner_fn=lambda idx: ops.add(load_a(idx), load_b(idx)), ranges=[s0, s1])
+│
+▼
+Layer 3: 后端代码 (Triton/C++ source)
+   形态：具体的 kernel 源代码
+   用途：实际执行
+   对应：codegen/triton.py, codegen/cpp.py 的输出
+   示例：@triton.jit def kernel(in_ptr, out_ptr, ...): ...
+```
+
+**关键设计特点**：
+
+1. **Define-by-Run IR**（Inductor 最独特的设计）：IR 的循环体是一个**可执行的 Python 函数**，而非静态的 AST 节点。这意味着变换 IR 不是通过"遍历并修改语法树"，而是通过"替换函数中的操作语义 handler"（即 `V.ops` 机制）。这在经典编译器中没有直接对应物——它更接近于 Lisp 的 macro 系统或 Smalltalk 的消息传递模型。
+
+2. **延迟求值包装**：`TensorBox` → `StorageBox` → `Buffer` 的三层包装使得计算描述与执行分离——IR 节点在被 `realize()` 之前不消耗任何内存。这类似于函数式编程中的 thunk/lazy evaluation 模式。
+
+3. **符号形状**：IR 中的形状信息使用 SymPy 符号变量（如 `s0`, `s1`）而非具体数值，使得编译结果可以适用于不同大小的输入。这对应经典编译器中的参数化优化（parametric optimization）概念。
+
+---
+
+### 3.3 优化 Pass 架构（Optimization Pass Architecture）
+
+**参考**：EaC3e Ch.8 "Introduction to Optimization"（§8.1–§8.6）
+
+#### 原理
+
+EaC3e §8.1 将编译器优化定义为一组**语义保持的程序变换**——变换后的程序必须产生与原程序相同的结果，但具有更好的性能特征（更快的执行速度、更低的内存占用）。
+
+经典的优化 Pass 组织遵循以下模式：
+
+```
+┌──────────────────────────────────────────┐
+│           优化 Pass 管理器                │
+│                                          │
+│  输入 IR ──→ [Pass 1] ──→ [Pass 2] ──→ ... ──→ [Pass N] ──→ 输出 IR
+│              │           │                      │
+│              │ 数据流    │ 数据流               │ 数据流
+│              │ 分析      │ 分析                 │ 分析
+│              │           │                      │
+│              ▼           ▼                      ▼
+│           变换决策     变换决策              变换决策
+└──────────────────────────────────────────┘
+```
+
+每个优化 Pass 通常包含两个阶段：
+1. **分析阶段**：在 IR 上收集信息（数据流分析、依赖分析、成本估计）
+2. **变换阶段**：根据分析结果修改 IR（替换、删除、合并节点）
+
+常见的优化类型包括：
+
+| 优化类型 | 经典名称 | 核心思想 |
+|----------|---------|---------|
+| 冗余消除 | 常量折叠 / CSE / 死代码消除 | 避免重复或无用计算 |
+| 代码移动 | 循环不变量外提 / 强度削弱 | 将计算移到更高效的位置 |
+| 过程间优化 | 内联 (Inlining) | 消除函数调用开销，暴露跨过程优化机会 |
+| 循环优化 | 循环融合 / 循环展开 / 循环交换 | 改善循环的局部性和并行性 |
+
+#### 为什么在 Inductor 中需要
+
+深度学习工作负载的优化空间巨大——一个简单的 `torch.softmax(x)` 分解后可能产生 5-6 个子算子，如果每个子算子独立执行，GPU kernel launch 开销和中间内存分配将远超实际计算成本。Inductor 需要系统性地应用多种优化策略：
+
+- **消除冗余**：常量折叠（编译时已知的计算直接用结果替换）、公共子表达式消除（CSE）
+- **融合操作**：将多个小算子合并为一个 kernel（避免 kernel launch 开销和中间内存分配）
+- **内存优化**：重新排列数据布局、复用 buffer、减少内存拷贝
+- **计算优化**：利用硬件特性（SIMD、Tensor Core、共享内存）
+
+#### 在本模块的具体体现
+
+Inductor 的优化分布在管线的多个阶段，形成**多轮优化架构**：
+
+```
+Phase 1: FX 图优化 Pass（compile_fx.py 中执行）
+│  ├── view_to_reshape:        统一 view 操作，为布局优化创造条件
+│  ├── fake_tensor_prop:        传播精确的形状和类型信息
+│  ├── 常量折叠:               编译时消除已知计算
+│  ├── 算子融合 (pattern match): 基于模式匹配的注意力机制/卷积-BN 融合
+│  └── _recursive_post_grad_passes: 递归应用多轮 post-grad 优化
+│
+Phase 2: Inlining（GraphLowering 阶段，graph.py）
+│  └── 将 pointwise kernel 的函数体复制到消费者中
+│      消除中间 buffer 的物化——等同于经典编译器的"过程内联"
+│
+Phase 3: 调度优化（Scheduler 阶段，scheduler.py）
+│  ├── 依赖分析:               构建 MemoryDep/StarDep/WeakDep 依赖图
+│  ├── 贪心融合:               can_fuse 合法性检查 + score_fusion 评分排序
+│  ├── 循环合并:               合并相似循环范围的操作
+│  ├── 内存规划:               buffer 重排序、布局优化、内存复用
+│  └── Combo Kernel:           将多个操作打包为复合 kernel
+│
+Phase 4: 代码生成优化（codegen 阶段）
+   ├── CSE:                    公共子表达式消除（tmp0, tmp1, ... 命名）
+   ├── 索引简化:               SymPy 简化索引表达式
+   └── Autotune:               自动搜索最优 kernel 配置参数
+```
+
+> **关键洞察**：Inductor 最显著的性能增益来自 Inlining + Fusion 的协同效应（论文 Table 4 消融实验），而非任何单一优化。这与经典编译器的经验一致——单靠指令调度或寄存器分配都不如两者的配合有效。
+
+---
+
+### 3.4 惰性求值与图构建（Lazy Evaluation & Graph Construction）
+
+**参考**：EaC3e Ch.4 §4.4 "Building a Control-Flow Graph"；PyTorch 2 论文 §2 "Background and Motivation"
+
+#### 原理
+
+在编译器设计中，**从动态执行中捕获静态计算图**是一个核心问题。两种主要的图构建策略：
+
+```
+策略一：AST 分析（静态方法）
+│  原理：在执行前分析源代码的语法结构
+│  优点：完整的程序结构可见，可做全局分析
+│  缺点：无法处理动态控制流（if/else 依赖运行时值）
+│  典型系统：XLA (TensorFlow 的编译器)、TVM
+│
+│  源代码 ──→ [解析] ──→ AST ──→ [变换] ──→ 优化后的 IR
+│
+策略二：Tracing（动态方法）
+│  原理：用示例输入实际执行程序，记录执行轨迹
+│  优点：自然支持动态控制流（只记录实际走的分支）
+│  缺点：只能捕获单次执行路径，不同输入可能走不同分支
+│  典型系统：JAX (jax.jit)、早期的 torch.jit.trace
+│
+│  源代码 ──→ [用示例输入执行] ──→ 执行轨迹 ──→ [抽象] ──→ IR
+│
+策略三：字节码转换（Dynamo 的方法）
+   原理：在 Python 字节码层面拦截和重写执行
+   优点：能在字节码层面精确处理 Python 动态语义
+   缺点：实现复杂，与 CPython 内部实现耦合
+   典型系统：torch._dynamo
+
+   源代码 ──→ [编译为字节码] ──→ [Dynamo 拦截] ──→ FX Graph + Guards
+```
+
+#### 为什么在 Inductor 中需要
+
+PyTorch 的核心理念是 **define-by-run**（也称为 eager mode）——计算图在执行过程中动态构建，而非预先定义。这意味着：
+
+1. **没有静态图**：用户写的 Python 代码就是模型定义，不存在单独的图定义文件
+2. **动态控制流**：`if x.sum() > 0:` 这样的条件分支在运行时才确定走向
+3. **动态形状**：`x[mask]` 的输出大小依赖于 mask 的内容，无法静态确定
+
+Inductor 作为 PyTorch 原生编译器，必须能够**从这种高度动态的执行模式中提取足够静态的计算图**，才能进行有效的编译优化。这本质上是一个"从动态到静态"的信息提取问题。
+
+#### 在本模块的具体体现
+
+PyTorch 2 的解决方案是 **Dynamo + FX Graph**：
+
+```
+用户 Python 代码
+  │
+  ▼ [Dynamo: 字节码追踪]
+torch._dynamo
+  │  输入：Python 函数的字节码
+  │  机制：
+  │  ├── 在字节码层面拦截函数执行
+  │  ├── 将 tensor 操作重定向到 FX Graph 构建器
+  │  ├── 遇到无法编译的结构时 "graph break"（回退到 eager）
+  │  └── 记录 Guard 条件（确保编译结果仍然有效的运行时约束）
+  │
+  ▼ [产出]
+FX Graph + Guards
+  │  FX Graph：静态的计算图（节点是 aten 算子，边是数据依赖）
+  │  Guards：运行时约束（如 "输入必须是形状为 [s0, s1] 的 float32 CPU tensor"）
+  │
+  ▼ [AOTAutograd: 自动微分处理]
+  │  用 fake tensor 模拟执行前向和反向传播
+  │  录制联合前向/反向图，用 min-cut 算法拆分
+  │
+  ▼ [产出]
+前向 FX Graph + 反向 FX Graph + Guards
+  │
+  ▼ [交给 Inductor]
+compile_fx_inner(gm, example_inputs, ...)
+```
+
+**Guard 机制的作用**：因为 Dynamo 只看到了一次执行的路径，它无法保证所有可能的输入都会走同一条路径。Guard 是一种**运行时契约**——每次调用编译后的函数时，先检查 Guard 条件是否仍然成立；如果成立，使用编译结果；如果不成立（比如输入形状变了），重新触发编译。
+
+```
+编译后的函数调用
+  │
+  ├── 检查 Guards
+  │   ├── Guards 通过 → 执行编译后的 kernel（快速路径）
+  │   └── Guards 失败 → 重新编译（慢速路径，可能产生新的 Guard）
+  │
+  └── Guard 的内容示例：
+      ├── "输入 x 的 device 是 'cuda'"
+      ├── "输入 x 的 dtype 是 torch.float32"
+      ├── "输入 x 的 shape 满足 s0 > 0 and s1 == 64"
+      └── "python 函数的闭包变量未发生变化"
+```
+
+> **与经典编译器的对比**：Guard 机制类似于 JIT 编译器中的 **deoptimization guard**（如 Java 的 HotSpot JVM 中的 "intrinsic guard"）。当 JIT 编译器基于某个假设做了优化（如"这个虚方法调用总是分发到同一个实现"），它会在入口处插入一个运行时检查；如果检查失败，就回退到解释执行。Dynamo 的 graph break 机制与此异曲同工。
+
+---
+
+## 四、编译管线主体流程梳理
+
+### 4.1 全景数据流与数据加工过程
 
 ```
 用户 Python 代码
@@ -292,7 +620,7 @@ AOTAutograd                      ── 用 fake tensor 运行 eager autograd，
     │  最终产品：性能提升 1.91x（推理）/ 1.45x（训练），保持完全兼容
 ```
 
-### 3.2 主体核心调用栈
+### 4.2 主体核心调用栈
 
 以下是从入口到产物的完整调用栈，标注了源码位置和关键行号：
 
@@ -353,9 +681,9 @@ compile_fx.py:787  compile_fx_inner(gm, example_inputs, ...)
 
 ---
 
-## 四、架构设计
+## 五、架构设计
 
-### 4.1 分层架构 UML
+### 5.1 分层架构 UML
 
 ```mermaid
 graph TB
@@ -421,7 +749,7 @@ graph TB
     S --> U
 ```
 
-### 4.2 核心类的 UML 类图
+### 5.2 核心类的 UML 类图
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -492,7 +820,7 @@ graph TB
 └─────────────────────────────────────────────────────────┘
 ```
 
-### 4.3 虚拟化系统（V）架构
+### 5.3 虚拟化系统（V）架构
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -532,7 +860,7 @@ graph TB
         # ... 所有内部代码通过 V.graph 访问当前图
 ```
 
-### 4.4 后端注册架构
+### 5.4 后端注册架构
 
 ```
 codegen/common.py:400  register_backend_for_device()
@@ -555,9 +883,9 @@ codegen/common.py:400  register_backend_for_device()
 
 ---
 
-## 五、关键源码讲解
+## 六、关键源码讲解
 
-### 5.1 编译入口：compile_fx_inner
+### 6.1 编译入口：compile_fx_inner
 
 **文件**：[compile_fx.py:787](torch/_inductor/compile_fx.py#L787)
 
@@ -612,7 +940,7 @@ Step 4: 后处理 (L1146)
     # 包括 CUDA Graph 封装等
 ```
 
-### 5.2 编排器：fx_codegen_and_compile
+### 6.2 编排器：fx_codegen_and_compile
 
 **文件**：[compile_fx.py:1772](torch/_inductor/compile_fx.py#L1772)
 
@@ -632,7 +960,7 @@ def fx_codegen_and_compile(gm, example_inputs, inputs_to_check, ...) -> OutputCo
     return scheme.codegen_and_compile(gm, example_inputs, inputs_to_check, graph_kwargs)
 ```
 
-### 5.3 核心编译器：_InProcessFxCompile.codegen_and_compile
+### 6.3 核心编译器：_InProcessFxCompile.codegen_and_compile
 
 **文件**：[compile_fx.py:1234](torch/_inductor/compile_fx.py#L1234)
 
@@ -678,7 +1006,7 @@ def codegen_and_compile(self, gm, example_inputs, inputs_to_check, graph_kwargs)
     return CompiledFxGraph(compiled_fn, ...)
 ```
 
-### 5.4 FX → IR 翻译：GraphLowering
+### 6.4 FX → IR 翻译：GraphLowering
 
 **文件**：[graph.py:356](torch/_inductor/graph.py#L356)
 
@@ -783,7 +1111,7 @@ FX Node: aten.add(TensorProxy, TensorProxy)
     ▼ 送入下一道工序：调度与融合
 ```
 
-### 5.5 算子 Lowering 注册表
+### 6.5 算子 Lowering 注册表
 
 **文件**：[lowering.py](torch/_inductor/lowering.py)
 
@@ -817,7 +1145,7 @@ def mm(self, other):
     # 4. 返回 TensorBox(ExternKernel 或 TemplateBuffer)
 ```
 
-### 5.6 调度器：Scheduler
+### 6.6 调度器：Scheduler
 
 **文件**：[scheduler.py:3078](torch/_inductor/scheduler.py#L3078)
 
@@ -984,7 +1312,7 @@ Triton/C++ Kernel 代码
     │  包含：编译后的函数 + 源代码 + 缓存信息
 ```
 
-### 5.7 依赖分析
+### 6.7 依赖分析
 
 **文件**：[dependencies.py](torch/_inductor/dependencies.py)
 
@@ -1007,7 +1335,7 @@ WeakDep(name)  ── 弱依赖（仅影响排序，不阻止融合）
 
 `extract_read_writes()` 函数通过安装分析 handler 并运行 loop body 函数来收集读写信息。
 
-### 5.8 编译产物封装：CompiledFxGraph
+### 6.8 编译产物封装：CompiledFxGraph
 
 **文件**：[output_code.py:445](torch/_inductor/output_code.py#L445)
 
@@ -1029,9 +1357,9 @@ class CompiledFxGraph(OutputCode):
 
 ---
 
-## 六、核心技术
+## 七、核心技术
 
-### 6.1 延迟求值（Lazy Evaluation）与数据流加工
+### 7.1 延迟求值（Lazy Evaluation）与数据流加工
 
 Inductor 不是在 lowering 时就生成代码，而是构建一个**延迟求值的 IR 图**，这是整个编译管线的核心设计理念。
 
@@ -1109,7 +1437,7 @@ Inductor 延迟执行：
 2. **布局优化依赖它**：`FlexibleLayout` 允许在调度阶段才决定最终内存布局
 3. **内存优化依赖它**：调度器看到完整的 IR 图后，才能做全局内存规划
 
-### 6.2 虚拟化操作系统（V.ops）
+### 7.2 虚拟化操作系统（V.ops）
 
 **文件**：[virtualized.py](torch/_inductor/virtualized.py)
 
@@ -1145,7 +1473,7 @@ class Virtualized(Generic[T]):
 2. **编译期全局状态**：`V.graph` — 整个编译期间不变，但不适合做真正的全局变量
 3. **Define-by-Run 解释切换**：`V.ops` — 替换不同 handler 实现代码生成、分析、传播等不同语义
 
-### 6.3 算子分解（Decomposition）
+### 7.3 算子分解（Decomposition）
 
 **设计思想**：将复杂算子拆解为更基础的组合，让优化在更细粒度上进行。
 
@@ -1163,7 +1491,7 @@ def log2(x):
 - 分解后的算子更容易被 Inlining 和 Fusion 优化
 - 代价是分解后的碎片如果没有被重新融合，性能会变差（这就是为什么 Inlining + Fusion 如此重要）
 
-### 6.4 融合算法
+### 7.4 融合算法
 
 **设计思想**：贪心算法，通过评分排序来决定融合顺序。
 
@@ -1187,7 +1515,7 @@ while 还有融合机会:
 - 估计节省的内存流量字节数
 - 原始图中的节点距离（距离近的优先融合）
 
-### 6.5 符号形状（Symbolic Shapes）
+### 7.5 符号形状（Symbolic Shapes）
 
 **设计思想**：张量大小用 SymPy 符号变量表示（如 `s0`, `s1`），而非具体数值。
 
@@ -1203,7 +1531,7 @@ while 还有融合机会:
 └── Meta Functions：在符号形状上传播输出形状（覆盖 2657/3028 个算子）
 ```
 
-### 6.6 后端代码生成
+### 7.6 后端代码生成
 
 生成的 Triton kernel 示例（论文 Figure 3，`torch.log2` 的最终输出）：
 
@@ -1229,7 +1557,7 @@ def kernel(in_ptr0, out_ptr0, xnumel, XBLOCK : tl.constexpr):
 
 ---
 
-## 七、自主学习 Debug 路线
+## 八、自主学习 Debug 路线
 
 以下路线设计为**可独立执行**的实验序列。每一步都有明确的输入、输出和关注点。
 
@@ -1495,7 +1823,7 @@ print(f"Match: {torch.allclose(eager_result, compiled_result, atol=1e-5)}")
 
 ---
 
-## 八、全局观检验清单
+## 九、全局观检验清单
 
 完成以上 8 步 debug 路线后，你应当能够回答以下问题。如果都能回答，说明全局观已建立：
 
