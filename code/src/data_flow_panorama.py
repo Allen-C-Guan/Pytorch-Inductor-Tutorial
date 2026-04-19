@@ -11,10 +11,14 @@
   工序 3：调度与融合（Scheduler：依赖分析 + 贪心融合 + 内存规划）
   工序 4：代码生成（Scheduler.codegen → Triton/C++ kernel + Python wrapper）
 
-教学目标：
-  1. 观察每一道工序的"加工前"和"加工后"产品状态
-  2. 理解数据形态在管线中的演变：Python → FX → IR → SchedulerNode → Code
-  3. 通过 IDE 断点深入理解每个阶段的关键变量
+教学模型：
+  def teaching_model(a, b, c):
+      x = a + b       # pointwise: add
+      y = x * c       # pointwise: mul
+      z = torch.relu(y)  # pointwise: relu
+      return x, y, z
+  纯 pointwise 链（add → mul → relu），三个输出均被返回。
+  全部算子都是 ATen 基础算子，不涉及分解；全部可融合为 1 个 kernel。
 
 运行方法：
   conda run -n pt-inductor python "my pytorch tutorial/code/src/data_flow_panorama.py"
@@ -35,15 +39,14 @@ import torch
 # 原料：教学模型
 # ============================================================================
 
-def teaching_model(x: torch.Tensor) -> torch.Tensor:
-    """教学模型：log2(x) * 2 + 1
+def teaching_model(a, b, c):
+    # 同样构造 3 个相互依赖但都被强制 return 的节点
+    x = a + b
+    y = x * c
+    z = torch.relu(y)
+    return x, y, z
 
-    选择理由（与论文 Figure 2/3 一致）：
-    - torch.log2 会被分解为 log * (1/ln2) → 展示"分解"过程
-    - 分解后的多个 pointwise 算子可被融合为 1 个 kernel → 展示"融合"
-    - 足够简单可读，足够完整地覆盖管线主要分支
-    """
-    return torch.log2(x) * 2 + 1
+
 
 
 # ============================================================================
@@ -99,9 +102,9 @@ BREAKPOINT_GUIDE = r"""
 ║  ┌──────────────────────────────────────────────────────────────────────┐   ║
 ║  │ 断点：torch/_inductor/compile_fx.py:1236                           │   ║
 ║  │       _InProcessFxCompile.codegen_and_compile()                    │   ║
-║  │ 加工前：self.gm — 原始 FX Graph（placeholder/log2/mul/add/output）  │   ║
-║  │ 加工后：self.gm — 标准化 FX Graph（shape 已传播、算子已分解）       │   ║
-║  │ 关注：self.gm.graph.nodes 数量变化                                  │   ║
+║  │ 加工前：self.gm — 原始 FX Graph（placeholder/add/mul/relu/output）  │   ║
+║  │ 加工后：self.gm — 标准化 FX Graph（shape 已传播）                   │   ║
+║  │ 关注：self.gm.graph.nodes — 本例全为基础算子，节点数不变           │   ║
 ║  │        node.meta['val'] — FakeTensor（形状/dtype 信息）            │   ║
 ║  └──────────────────────────────────────────────────────────────────────┘   ║
 ║                                                                              ║
@@ -113,14 +116,14 @@ BREAKPOINT_GUIDE = r"""
 ║  │ 加工后：self.graph.buffers → {buf0: Buffer, buf1: Buffer, ...}     │   ║
 ║  │         self.graph.operations → 对应的 IR 操作                      │   ║
 ║  │ 关注：self.graph.buffers — 数据存储视图（仓储物流清单）             │   ║
-║  │       self.graph.operations — 计算逻辑视图（车间施工图纸）          │   ║
-║  │       每个 buffer.data — Pointwise? Reduction? ExternKernel?       │   ║
+║  │       self.graph.operations — 计算逻辑视图（车间施工图纸）            ║   ║
+║  │       每个 buffer.data — 全部为 Pointwise（本例无 Reduction 等）    │   ║
 ║  └──────────────────────────────────────────────────────────────────────┘   ║
 ║                                                                              ║
 ║  工序 2 子步骤：call_function 处理单个 FX Node                               ║
 ║  ┌──────────────────────────────────────────────────────────────────────┐   ║
 ║  │ 断点：torch/_inductor/graph.py:1319  GraphLowering.call_function() │   ║
-║  │ 加工前：target = "aten.log" / "aten.mul" / "aten.add"              │   ║
+║  │ 加工前：target = "aten.add" / "aten.mul" / "aten.relu"             │   ║
 ║  │ 加工后：result = TensorBox(StorageBox(Pointwise(...)))             │   ║
 ║  │ 关注：target — 当前翻译的算子名                                     │   ║
 ║  │       result — 生成的 IR 节点类型                                   │   ║
@@ -131,10 +134,10 @@ BREAKPOINT_GUIDE = r"""
 ║  工序 3：调度与融合                                                          ║
 ║  ┌──────────────────────────────────────────────────────────────────────┐   ║
 ║  │ 断点：torch/_inductor/scheduler.py:3078  Scheduler.__init__()      │   ║
-║  │ 加工前：nodes — 独立 IR 节点（3~5 个小节点）                       │   ║
-║  │ 加工后：self.nodes — 融合后 FusedSchedulerNode（1~2 个）            │   ║
+║  │ 加工前：nodes — 独立 IR 节点（3~4 个 pointwise 节点）              │   ║
+║  │ 加工后：self.nodes — 融合后 FusedSchedulerNode（1 个）              │   ║
 ║  │ 关注：self.nodes — 融合前后数量对比（最直观的变化！）               │   ║
-║  │       self.dependency_data — 依赖图（MemoryDep/StarDep）            │   ║
+║  │       self.dependency_data — 依赖图（MemoryDep）                    │   ║
 ║  │       node.node_group — 哪些原始节点被融合在一起                    │   ║
 ║  └──────────────────────────────────────────────────────────────────────┘   ║
 ║                                                                              ║
@@ -168,18 +171,27 @@ def main():
     print("  【原料】用户 Python 代码")
     print(f"{'═' * 70}")
 
-    x = torch.rand(4, 4) * 5 + 0.1  # 正数，避免 log2 负数产生 nan
+    N = 1024
+    a = torch.randn(N)
+    b = torch.randn(N)
+    c = torch.randn(N)
     print(f"""
   函数定义：
-    def model(x):
-        return torch.log2(x) * 2 + 1
+    def teaching_model(a, b, c):
+        x = a + b          # pointwise: add
+        y = x * c          # pointwise: mul
+        z = torch.relu(y)  # pointwise: relu
+        return x, y, z
 
   输入张量：
-    shape={list(x.shape)}, dtype={x.dtype}, device={x.device}
-    值域: [{x.min():.2f}, {x.max():.2f}]（正数，避免 log2 产生 nan）
+    a: shape=[{N}], dtype={a.dtype}, device={a.device}
+    b: shape=[{N}], dtype={b.dtype}, device={b.device}
+    c: shape=[{N}], dtype={c.dtype}, device={c.device}
 
   Eager 模式结果（基准）：
-    {teaching_model(x)[0, :4].tolist()}""")
+    x = a + b:  [{", ".join(f"{v:.4f}" for v in (a + b)[:5])}, ...]
+    y = x * c:  [{", ".join(f"{v:.4f}" for v in ((a + b) * c)[:5])}, ...]
+    z = relu(y): [{", ".join(f"{v:.4f}" for v in torch.relu((a + b) * c)[:5])}, ...]""")
 
     # ================================================================
     # 【工序 0】Dynamo 追踪 → FX GraphModule
@@ -190,14 +202,15 @@ def main():
         """
   加工过程：
     Python 字节码分析 → 构建 FX Graph
-    - torch.log2(x) → call_function 节点 (target=aten.log2)
-    - * 2           → call_function 节点 (target=aten.mul)
-    - + 1           → call_function 节点 (target=aten.add)
-    - x             → placeholder 节点
-    - 返回值        → output 节点""")
+    - a, b, c         → placeholder 节点 (3 个输入)
+    - x = a + b       → call_function 节点 (target=aten.add)
+    - y = x * c       → call_function 节点 (target=aten.mul)
+    - z = relu(y)     → call_function 节点 (target=aten.relu)
+    - return x, y, z  → output 节点 (3 个输出)
+    本例全部为基础 ATen 算子，Dynamo 直接映射，无需分解。""")
 
     try:
-        exported = torch._dynamo.export(teaching_model)(x)
+        exported = torch._dynamo.export(teaching_model)(a, b, c)
         gm = exported.graph_module
         print_fx_graph(gm, "产品：Dynamo 追踪产出的 FX Graph")
     except Exception as e:
@@ -216,12 +229,13 @@ def main():
      加工前：FX 节点缺少精确的 shape/dtype
      加工后：每个节点的 meta['val'] 包含 FakeTensor(shape, dtype)
 
-  2. _recursive_post_grad_passes — 算子分解 + 模式匹配
-     加工前：torch.log2 是一个大算子（1 个节点）
-     加工后：被分解为 aten.log + aten.mul（× 1/ln2 常量）→ 节点数增加
-     ⭐ 这是"两阶段优化哲学"的第一阶段铺垫：分解创造碎片，Inlining/Fusion 重新粘合
+  2. aot_autograd 算子分解 — 将复合算子拆为 ATen 基础算子
+     本例的 add/mul/relu 已是基础算子，无需分解，节点数不变
+     （对比旧模型：gelu 会被分解为 mul + erf + add + mul 等多个基础算子）
 
-  3. view_to_reshape — 统一 view 操作（本例不涉及）
+  3. _recursive_post_grad_passes — 后处理优化（模式匹配、常量折叠等）
+
+  4. view_to_reshape — 统一 view 操作（本例不涉及）
 
   🔴 断点：torch/_inductor/compile_fx.py:1236
            _InProcessFxCompile.codegen_and_compile()
@@ -237,29 +251,32 @@ def main():
   加工过程（graph.py:1049 GraphLowering.run()）：
     遍历 FX Graph 的每个节点，调用 call_function() 翻译为 IR
 
-    以 log2(x) * 2 + 1 为例（分解后），翻译过程：
+    本例全部为 Pointwise 算子，翻译过程：
 
-    FX Node                →  IR Node
-    ─────────────────────────────────────────────────────────────
-    placeholder(x)         →  TensorBox(输入 buffer)
-    aten.log(x)            →  TensorBox(StorageBox(Pointwise(ops.load+ops.log)))
-    aten.mul(log, 1/ln2)   →  TensorBox(StorageBox(Pointwise(ops.mul)))
-    aten.mul(result, 2)    →  TensorBox(StorageBox(Pointwise(ops.mul)))
-    aten.add(result, 1)    →  TensorBox(StorageBox(Pointwise(ops.add)))
+    FX Node                       →  IR Node
+    ─────────────────────────────────────────────────────────────────────────────
+    placeholder(a)                →  TensorBox(输入 buffer a)
+    placeholder(b)                →  TensorBox(输入 buffer b)
+    placeholder(c)                →  TensorBox(输入 buffer c)
+    aten.add(a, b)                →  TensorBox(StorageBox(Pointwise(ops.add)))
+    aten.mul(x, c)                →  TensorBox(StorageBox(Pointwise(ops.mul)))
+    aten.relu(y)                  →  TensorBox(StorageBox(Pointwise(ops.relu)))
+    output: (x, y, z)            →  三个输出 buffer
 
     ⭐ 关键事件：Inlining 发生在此阶段！
+    - x 被 y 使用，y 被 z 使用 → 形成依赖链 add → mul → relu
     - 多个 pointwise 的 inner_fn 被复制到消费者中
-    - 最终可能只有 1 个大的 inner_fn 包含 load→log→mul→mul→add 全部操作
-    - 中间的 StorageBox 被标记为 Unrealized（不分配内存）
-    - 这就是为什么 V.ops 这么重要：inner_fn 中的 ops.load/ops.log
+    - 最终 inner_fn 融合为 1 个大的闭包（load_a + load_b → add → load_c → mul → relu）
+    - 由于 x 和 y 也被返回，它们对应的 StorageBox 不会被标记为 Unrealized
+    - 这就是为什么 V.ops 这么重要：inner_fn 中的 ops.load/ops.add/ops.mul/ops.relu
       不是真正计算，而是通过 V.ops handler 分发到不同行为
 
   🔴 断点 1：torch/_inductor/graph.py:1049  GraphLowering.run()
      加工前：self.graph.buffers = {} (空)
-     加工后：self.graph.buffers 包含所有 Buffer（buf0, buf1...）
+     加工后：self.graph.buffers 包含所有 Buffer
 
   🔴 断点 2：torch/_inductor/graph.py:1319  GraphLowering.call_function()
-     加工前：target = "aten.log" / "aten.mul" / "aten.add"
+     加工前：target = "aten.add" / "aten.mul" / "aten.relu"
      加工后：result = TensorBox(StorageBox(Pointwise(...)))
      ⭐ 关注：result.data.data.inner_fn — define-by-run IR 的核心闭包！""")
 
@@ -275,20 +292,23 @@ def main():
   1. 依赖分析 — extract_read_writes() 通过 V.ops RecordLoadStore handler
      提取每个节点的内存读写模式，构建 MemoryDep 依赖图
      加工前：IR 节点只有计算逻辑（inner_fn），没有依赖关系
-     加工后：构建出完整的依赖图（谁读谁的 buffer、谁写谁的 buffer）
+     加工后：构建出完整的依赖图
+       add 读 a, b → 写 x
+       mul 读 x, c → 写 y
+       relu 读 y   → 写 z
 
   2. 贪心融合 — 最多 10 轮迭代，将可融合的节点合并
-     加工前：3~5 个独立 IR 节点
-     加工后：1 个 FusedSchedulerNode（本例全部是 pointwise，全部可融合）
+     加工前：3 个独立 pointwise IR 节点
+     加工后：1 个 FusedSchedulerNode（全部 pointwise 融合为 1 个 kernel）
      ⭐ 这是"两阶段优化哲学"的第二阶段：Fusion 把碎片粘合回来
 
   3. 内存规划 — 计算 buffer 生命周期，决定复用策略
-     Unrealized 的 buffer 不分配内存，只为最终输出分配
+     三个输出（x, y, z）都需要分配内存，因为全部被返回
 
   🔴 断点：torch/_inductor/scheduler.py:3078  Scheduler.__init__()
-     加工前：传入的 operations 为多个独立 IR 节点
-     加工后：self.nodes 为融合后的 FusedSchedulerNode
-     ⭐ 对比 self.nodes 的长度变化——这是融合效果最直观的体现""")
+     加工前：传入的 operations 为 3 个独立 IR 节点
+     加工后：self.nodes 为 1 个 FusedSchedulerNode
+     ⭐ 对比 self.nodes 的长度变化——从 3 变为 1，融合效果最直观的体现""")
 
     # ================================================================
     # 【工序 4】代码生成
@@ -299,13 +319,13 @@ def main():
         """
   加工过程（scheduler.py:7324 Scheduler.codegen()）：
 
-  1. Kernel 代码生成 — 为每个 FusedSchedulerNode 生成后端代码
+  1. Kernel 代码生成 — 为 FusedSchedulerNode 生成后端代码
      CPU → C++/OpenMP 代码（codegen/cpp.py:2000 CppKernel）
      GPU → Triton 代码（codegen/triton.py:2767 TritonKernel）
-     本例（CPU）：所有操作融合为 1 个 C++ kernel
+     本例（CPU）：融合后的 add + mul + relu 生成 1 个 C++ kernel
 
   2. Wrapper 代码生成 — 生成 Python 调用入口
-     包含 torch.empty() 内存分配 + kernel 调用 + CSE 优化
+     包含 torch.empty() 内存分配（3 个输出 buffer）+ kernel 调用 + CSE 优化
 
   3. 编译为共享库（.so），动态加载
 
@@ -322,13 +342,14 @@ def main():
     print(f"{'═' * 70}")
 
     compiled_model = torch.compile(teaching_model, backend="inductor", fullgraph=True)
-    result = compiled_model(x)
+    result = compiled_model(a, b, c)
 
+    eager_x, eager_y, eager_z = teaching_model(a, b, c)
     print(f"""
   ✅ 编译完成！结果验证：
-    Eager:    {teaching_model(x)[0, :4].tolist()}
-    Compiled: {result[0, :4].tolist()}
-    数值一致: {torch.allclose(result, teaching_model(x))}""")
+    Eager x:    [{", ".join(f"{v:.4f}" for v in eager_x[:5])}, ...]
+    Compiled x: [{", ".join(f"{v:.4f}" for v in result[0][:5])}, ...]
+    数值一致: {torch.allclose(result[0], eager_x) and torch.allclose(result[1], eager_y) and torch.allclose(result[2], eager_z)}""")
 
     # ================================================================
     # 【最终产品】查看生成的代码
@@ -367,5 +388,15 @@ def main():
     print(BREAKPOINT_GUIDE)
 
 
+cpu_fusion_target = torch.compile(teaching_model, backend="inductor", fullgraph=True)
+
 if __name__ == "__main__":
-    main()
+    # 【核心修改】：去除 device="cuda"，让张量默认留在 CPU
+    N = 1024
+    a = torch.randn(N)
+    b = torch.randn(N)
+    c = torch.randn(N)
+
+    print("开始进行 CPU 编译与执行...")
+    out = cpu_fusion_target(a, b, c)
+    print("执行完毕！请去 torch_compile_debug 文件夹查看生成的 C++ 源码。")

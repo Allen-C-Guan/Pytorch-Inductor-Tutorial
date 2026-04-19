@@ -2,9 +2,10 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "pytorch_tutorial",
+            "name": "Run: pytorch_tutorial",
             "type": "debugpy",
             "request": "launch",
+            "noDebug": true,
             "program": "${file}",
             "console": "integratedTerminal",
             "python": "/opt/homebrew/Caskroom/miniforge/base/envs/pt-inductor/bin/python",
@@ -14,9 +15,10 @@
             }
         },
         {
-            "name": "pytorch_tutorial (with Inductor logs)",
+            "name": "Run: pytorch_tutorial (with Inductor logs)",
             "type": "debugpy",
             "request": "launch",
+            "noDebug": true,
             "program": "${file}",
             "console": "integratedTerminal",
             "python": "/opt/homebrew/Caskroom/miniforge/base/envs/pt-inductor/bin/python",
@@ -24,6 +26,39 @@
             "env": {
                 "CONDA_PREFIX": "/opt/homebrew/Caskroom/miniforge/base/envs/pt-inductor",
                 "TORCH_LOGS": "+inductor"
+            }
+        },
+        {
+            "name": "Debug: pytorch_tutorial",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "justMyCode": false,
+            "console": "integratedTerminal",
+            "python": "/opt/homebrew/Caskroom/miniforge/base/envs/pt-inductor/bin/python",
+            "cwd": "${fileDirname}",
+            "env": {
+                "CONDA_PREFIX": "/opt/homebrew/Caskroom/miniforge/base/envs/pt-inductor",
+                "TORCH_COMPILE_DEBUG":"1",
+                "TORCHINDUCTOR_FX_GRAPH_CACHE": "0",
+                "TORCH_TRACE":"/Users/allen/Code/pytorch/my pytorch tutorial/code/trace",
+            }
+        },
+        {
+            "name": "Debug: pytorch_tutorial (with Inductor logs)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "justMyCode": false,
+            "console": "integratedTerminal",
+            "python": "/opt/homebrew/Caskroom/miniforge/base/envs/pt-inductor/bin/python",
+            "cwd": "${fileDirname}",
+            "env": {
+                "CONDA_PREFIX": "/opt/homebrew/Caskroom/miniforge/base/envs/pt-inductor",
+                "TORCH_LOGS": "+inductor",
+                "TORCH_COMPILE_DEBUG":"1",
+                "TORCHINDUCTOR_FX_GRAPH_CACHE": "0",
+                "TORCH_TRACE":"/Users/allen/Code/pytorch/my pytorch tutorial/code/trace",
             }
         }
     ]
