@@ -20,19 +20,20 @@
 my pytorch tutorial/
 ├── Introduction/
 │   ├── compiler_view_tutorial/      # 编译器设计视角系统性分析（12章教材）
-│   │   ├── ch01_introduction/       #   第 1 章：编译器设计导论与 Inductor 全景
-│   │   ├── ch02_fx_graph/           #   第 2 章：Python 字节码追踪与 FX Graph 构建
-│   │   ├── ch03_ir_design/          #   第 3 章：Inductor 中间表示设计
-│   │   ├── ch04_lowering/           #   第 4 章：Lowering——从 FX Graph 到 Inductor IR
-│   │   ├── ch05_optimization/       #   第 5 章：图优化
-│   │   ├── ch06_dependency/         #   第 6 章：依赖分析与调度前置
-│   │   ├── ch07_fusion/             #   第 7 章：融合策略与循环优化
-│   │   ├── ch08_codegen/            #   第 8 章：指令选择与代码生成
-│   │   ├── ch09_memory/             #   第 9 章：内存管理与缓冲区分配
-│   │   ├── ch10_scheduling/         #   第 10 章：指令调度
-│   │   ├── ch11_e2e_pipeline/       #   第 11 章：端到端编译流程回顾
-│   │   ├── ch12_ecosystem/          #   第 12 章：与 PyTorch 生态的协同设计
-│   │   └── appendices/              #   附录（EaC 映射表、术语表）
+│   │   ├── ch01_introduction.md     #   第 1 章：编译器设计导论与 Inductor 全景
+│   │   ├── ch02_fx_graph.md         #   第 2 章：Python 字节码追踪与 FX Graph 构建
+│   │   ├── ch03_ir_design.md        #   第 3 章：Inductor 中间表示设计
+│   │   ├── ch04_lowering.md         #   第 4 章：Lowering——从 FX Graph 到 Inductor IR
+│   │   ├── ch05_optimization.md     #   第 5 章：图优化
+│   │   ├── ch06_dependency.md       #   第 6 章：依赖分析与调度前置
+│   │   ├── ch07_fusion.md           #   第 7 章：融合策略与循环优化
+│   │   ├── ch08_codegen.md          #   第 8 章：指令选择与代码生成
+│   │   ├── ch09_memory.md           #   第 9 章：内存管理与缓冲区分配
+│   │   ├── ch10_scheduling.md       #   第 10 章：指令调度
+│   │   ├── ch11_e2e_pipeline.md     #   第 11 章：端到端编译流程回顾
+│   │   ├── ch12_ecosystem.md        #   第 12 章：与 PyTorch 生态的协同设计
+│   │   ├── appendix_a_eac_mapping.md #   附录 A：EaC 映射表
+│   │   └── appendix_b_glossary.md   #   附录 B：术语表
 │   ├── skeleton_tutorial/           # 骨架教程：按编译管线阶段组织的系统性教学文档
 │   │   ├── inductor_overview.md     #   全景地图：Inductor 文件结构与功能指南
 │   │   ├── phase1_global_view.md    #   Phase 1：全局观 — 编译管线数据流全景
@@ -71,11 +72,11 @@ my pytorch tutorial/
 
 | 部分 | 章节 | 核心内容 |
 |------|------|---------|
-| 基础与全景 | [第 1 章](Introduction/compiler_view_tutorial/ch01_introduction/ch01_introduction.md) · [第 2 章](Introduction/compiler_view_tutorial/ch02_fx_graph/ch02_fx_graph.md) | 编译器设计导论、Dynamo 字节码追踪与 FX Graph |
-| 前端 | [第 3 章](Introduction/compiler_view_tutorial/ch03_ir_design/ch03_ir_design.md) | Inductor IR 设计 |
-| 中间层 | [第 4 章](Introduction/compiler_view_tutorial/ch04_lowering/ch04_lowering.md) · [第 5 章](Introduction/compiler_view_tutorial/ch05_optimization/ch05_optimization.md) | Lowering、图优化 |
-| 后端 | [第 6 章](Introduction/compiler_view_tutorial/ch06_dependency/ch06_dependency.md) · [第 7 章](Introduction/compiler_view_tutorial/ch07_fusion/ch07_fusion.md) · [第 8 章](Introduction/compiler_view_tutorial/ch08_codegen/ch08_codegen.md) · [第 9 章](Introduction/compiler_view_tutorial/ch09_memory/ch09_memory.md) · [第 10 章](Introduction/compiler_view_tutorial/ch10_scheduling/ch10_scheduling.md) | 依赖分析、融合、代码生成、内存管理、指令调度 |
-| 集成与展望 | [第 11 章](Introduction/compiler_view_tutorial/ch11_e2e_pipeline/ch11_e2e_pipeline.md) · [第 12 章](Introduction/compiler_view_tutorial/ch12_ecosystem/ch12_ecosystem.md) | 端到端流程回顾、PyTorch 生态协同 |
+| 基础与全景 | [第 1 章](Introduction/compiler_view_tutorial/ch01_introduction.md) · [第 2 章](Introduction/compiler_view_tutorial/ch02_fx_graph.md) | 编译器设计导论、Dynamo 字节码追踪与 FX Graph |
+| 前端 | [第 3 章](Introduction/compiler_view_tutorial/ch03_ir_design.md) | Inductor IR 设计 |
+| 中间层 | [第 4 章](Introduction/compiler_view_tutorial/ch04_lowering.md) · [第 5 章](Introduction/compiler_view_tutorial/ch05_optimization.md) | Lowering、图优化 |
+| 后端 | [第 6 章](Introduction/compiler_view_tutorial/ch06_dependency.md) · [第 7 章](Introduction/compiler_view_tutorial/ch07_fusion.md) · [第 8 章](Introduction/compiler_view_tutorial/ch08_codegen.md) · [第 9 章](Introduction/compiler_view_tutorial/ch09_memory.md) · [第 10 章](Introduction/compiler_view_tutorial/ch10_scheduling.md) | 依赖分析、融合、代码生成、内存管理、指令调度 |
+| 集成与展望 | [第 11 章](Introduction/compiler_view_tutorial/ch11_e2e_pipeline.md) · [第 12 章](Introduction/compiler_view_tutorial/ch12_ecosystem.md) | 端到端流程回顾、PyTorch 生态协同 |
 
 ### 第三阶段：骨架教程——逐阶段学习
 
