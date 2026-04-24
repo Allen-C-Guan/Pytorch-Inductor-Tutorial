@@ -15,9 +15,9 @@
 
 **学习目标：**
 
-1. 理解编译器的基本概念：前端 (frontend)、中间表示 (IR)、后端 (backend)、优化器 (optimizer)
+1. 理解编译器的基本概念：前端 (frontend)、中间表示（Intermediate Representation, IR）、后端 (backend)、优化器 (optimizer)
 2. 理解为什么机器学习系统需要编译器，以及 ML 编译器的设计动机
-3. 掌握 PyTorch 编译栈的全貌：Dynamo -> FX -> Inductor
+3. 掌握 PyTorch 编译栈的全貌：Dynamo -> FX -> AotAutograd -> Inductor
 4. 了解 Inductor 的核心设计哲学：eager-first、Python-first、semantic equivalence
 5. 能够运行一个基本的 `torch.compile()` 示例并理解其输出
 
@@ -82,7 +82,7 @@ def forward(x, w1, b1, w2, b2):
 
 在 eager mode 下，PyTorch 会逐行执行：先计算 `x @ w1`，申请一块内存存储结果，再计算 `+ b1`，再申请一块内存……每次操作都是一个独立的 kernel launch，每个中间张量都需要分配和释放内存。
 
-但编译器可以做到更多：它可以发现 `x @ w1 + b1` 可以融合 (fuse) 成一个操作，减少一次内存读写；它可以发现 `relu` 后面接矩阵乘法，中间结果 `a` 不需要写回全局内存，可以保持在寄存器或共享内存中。这就是**算子融合** (operator fusion)，ML 编译器最重要的优化之一。
+但编译器可以做到更多：它可以发现 `x @ w1 + b1` 可以融合（fusion）成一个操作，减少一次内存读写；它可以发现 `relu` 后面接矩阵乘法，中间结果 `a` 不需要写回全局内存，可以保持在寄存器或共享内存中。这就是**算子融合** (operator fusion)，ML 编译器最重要的优化之一。
 
 #### 2.1.3 编译 vs 解释 vs JIT
 
@@ -148,13 +148,14 @@ graph TB
     style Halide fill:#fce4ec
 ```
 
-**XLA (Accelerated Linear Algebra)** 是 Google 为 TensorFlow 开发的编译器。它采用图级别的编译策略，在编译时对整个计算图进行全局优化。XLA 的设计倾向于静态 shape，对动态 shape 的支持有限。XLA 使用 HLO (High Level Optimizer) 作为中间表示。
+| 编译器 | 开发方 | 核心特点 | 设计哲学 |
+|--------|--------|---------|---------|
+| **XLA** | Google/TensorFlow | 图级别编译，HLO IR | 静态 shape 优先 |
+| **TVM** | Apache | 搜索式调优 (autotuning)，计算与调度分离 | 用户指定 schedule |
+| **Halide** | MIT | 算法与调度完全分离，面向图像处理 | DSL 方式描述计算 |
+| **Inductor** | Meta/PyTorch | Python-first，Triton GPU codegen，JIT 编译 | eager-first，自动优化 |
 
-**TVM (Tensor Virtual Machine)** 是 Apache 基金会孵化的开源编译器。它的特色是**搜索式调优** (autotuning)：通过在实际硬件上搜索不同的算子实现方案，找到最优的参数配置。TVM 的调度 (schedule) 与计算 (computation) 是分离的，用户可以灵活地控制算子的实现方式。
-
-**Halide** 是 MIT 开发的一种领域特定语言 (DSL) 和编译器，主要面向图像处理和计算摄影。Halide 的核心思想是**算法与调度完全分离**：用户先描述"计算什么"，再描述"怎么计算"。
-
-**PyTorch Inductor** 与上述系统的主要区别在于它的设计哲学：**Python-first** 和 **eager-first**。Inductor 不引入新的语言或 DSL，而是直接编译 Python 代码（通过 Dynamo 追踪）。它不要求用户手动指定调度策略，而是自动进行融合和优化。它使用 OpenAI 的 Triton 语言进行 GPU 代码生成，而不是直接写 PTX 或 CUDA。
+Inductor 与上述系统的核心区别在于 **Python-first** 和 **eager-first**：不引入新 DSL，不要求用户手动指定调度策略，而是通过 `torch.compile()` 一行代码透明地提供编译优化。
 
 #### 2.1.6 PyTorch 编译栈全景
 
@@ -182,13 +183,26 @@ graph LR
     style G fill:#e8f5e9
 ```
 
-**Dynamo** (`torch._dynamo`) 是编译栈的前端。它通过拦截 Python 字节码执行来追踪 (trace) 程序的控制流和数据流，将 Python 函数转换为 FX Graph。Dynamo 的核心挑战在于处理 Python 的动态特性——它需要识别哪些代码是"可编译的"（tensor 操作），哪些需要"打断"（guard），在运行时重新评估。
+**Dynamo** (`torch._dynamo`) 是编译栈的前端。它通过拦截 Python 字节码执行来追踪（trace）程序的控制流和数据流，将 Python 函数转换为 FX Graph。Dynamo 的核心挑战在于处理 Python 的动态特性——它需要识别哪些代码是"可编译的"（tensor 操作），哪些需要"打断"（guard），在运行时重新评估。
 
 **FX** (`torch.fx`) 是编译栈的中间表示层。FX Graph 是一个有向无环图 (DAG)，节点 (Node) 代表操作（如 `call_module`, `call_function`, `placeholder`, `output`），边代表数据依赖。FX 提供了一套 Pythonic 的 API 来操作和变换计算图。
 
-**Inductor** (`torch._inductor`) 是编译栈的后端。它接收 FX Graph，将其翻译 (lower) 为 Inductor IR，然后进行优化和调度，最终生成 Triton kernel（GPU）或 C++ 代码（CPU）。
+**AotAutograd** (`torch._functorch/aot_autograd.py`) 位于 FX 和 Inductor 之间，负责将融合的前向-反向计算图拆分为独立的前向图和反向图。它的核心函数 `aot_function(fw_compiler=..., bw_compiler=...)` 接收一个联合图（joint graph），通过 `partition_fn` 将其拆分，然后分别调用 `fw_compiler` 和 `bw_compiler` 编译前向和反向部分。这使得 Inductor 可以分别优化前向传播和反向传播，例如在前向图中插入重计算点（activation checkpointing）以减少显存占用。完整编译栈实际上是：
 
-三者的关系可以用下面的比喻来理解：如果编写 PyTorch 模型就像写 Python 脚本，那么 Dynamo 是"读懂你脚本的编辑"，FX 是"剧本大纲"，Inductor 是"把剧本变成电影的导演"。
+```mermaid
+graph LR
+    A["Python 代码"] --> B["Dynamo<br/>(字节码追踪)"]
+    B --> C["FX Graph"]
+    C --> D["AotAutograd<br/>(前向/反向拆分)"]
+    D --> E["Inductor<br/>(Lowering + Scheduling + Codegen)"]
+    E --> F["优化后的 kernel"]
+
+    style D fill:#f3e5f5
+```
+
+**Inductor** (`torch._inductor`) 是编译栈的后端。它接收 AotAutograd 拆分后的 FX Graph，将其翻译 (lower) 为 Inductor IR，然后进行优化和调度，最终生成 Triton kernel（GPU）或 C++ 代码（CPU）。
+
+三者的关系可以用下面的比喻来理解：如果编写 PyTorch 模型就像写 Python 脚本，那么 Dynamo 是"读懂你脚本的审稿人"，FX 是"剧本大纲"，AotAutograd 是"把剧本拆分成日戏和夜戏的统筹"，Inductor 是"把剧本变成电影的导演"。
 
 ### 2.2 算法背景
 
@@ -218,17 +232,7 @@ DAG 的关键性质是**没有环**——这意味着总是存在一种合法的
 
 #### 2.2.2 时间复杂度
 
-在分析编译器算法时，我们使用大 O 记号 (Big-O notation) 来描述算法的效率。下表列出了本书中常见的复杂度级别：
-
-| 复杂度 | 含义 | 在 Inductor 中的例子 |
-|--------|------|---------------------|
-| O(1) | 常数时间 | 查找节点的直接依赖 |
-| O(n) | 线性时间 | 遍历所有节点（n = 节点数） |
-| O(n log n) | 线性对数 | 排序节点 |
-| O(n^2) | 平方时间 | 计算所有节点对之间的依赖 |
-| O(V + E) | 图遍历 | DFS/BFS 遍历计算图 (V = 节点数, E = 边数) |
-
-在编译器设计中，一个重要原则是：**编译时间应该是可接受的**。如果编译时间超过了它带来的加速收益，那编译就失去了意义。因此，Inductor 在设计优化算法时，需要在优化质量和编译时间之间取得平衡。
+本书使用大 O 记号 (Big-O notation) 分析算法效率。Inductor 的关键原则是编译时间不应超过其带来的加速收益，因此优化算法需在质量和编译时间间取得平衡。
 
 ---
 
@@ -503,7 +507,7 @@ sequenceDiagram
 |------|---------|-----------|
 | **Dynamo** | `torch/_dynamo/` | 通过拦截 CPython 字节码执行，将 Python 函数的 tensor 操作追踪为 FX Graph |
 | **FX** | `torch/fx/` | 提供基于 Python 的计算图 IR（Node + Graph + GraphModule），支持图变换和代码生成 |
-| **compile_fx** | `torch/_inductor/compile_fx.py` | Inductor 的入口点，协调 GraphLowering、AotAutograd 和编译缓存 |
+| **compile_fx** | `torch/_inductor/compile_fx.py` | Inductor 的入口点，协调 AotAutograd、GraphLowering 和编译缓存 |
 | **GraphLowering** | `torch/_inductor/graph.py` | 将 FX Graph 翻译为 Inductor IR，管理 buffer 生命周期 |
 | **Lowering** | `torch/_inductor/lowering.py` | 维护 FX 算子到 Inductor IR 构建函数的映射表，是翻译的核心逻辑 |
 | **IR** | `torch/_inductor/ir.py` | 定义 Inductor 的中间表示：TensorBox、Buffer、Pointwise、Reduction 等 IR 节点 |
@@ -512,6 +516,10 @@ sequenceDiagram
 | **Triton Codegen** | `torch/_inductor/codegen/triton.py` | 将调度后的 IR 节点翻译为 Triton kernel 代码（GPU 后端） |
 | **C++ Codegen** | `torch/_inductor/codegen/cpp.py` | 将调度后的 IR 节点翻译为 C++ 循环代码（CPU 后端） |
 | **Config** | `torch/_inductor/config.py` | 管理 Inductor 的所有编译选项和 flag（如 triton.cudagraphs、fallback_enabled） |
+
+### 4.3.1 全局编译状态：V.graph
+
+Inductor 通过 `torch/_inductor/virtualized.py` 中的 `V` 对象提供线程局部、动态作用域的全局状态访问。其中 `V.graph` 是最常用的属性之一——它指向当前编译过程中的 `GraphLowering` 实例，包含了 buffer 管理、shape 环境和符号表达式等信息。Inductor 代码中随处可见 `V.graph.sizevars`（符号表达式求解）等访问模式。这种设计避免了在深层调用栈中显式传递编译上下文，类似于编译器实现中常见的 "implicit context" 模式。
 
 ### 4.4 关键源文件速查表
 
@@ -607,8 +615,6 @@ Inductor 提供了丰富的调试和诊断工具：
 
 **`TORCH_COMPILE_DEBUG=1`** 会输出详细的调试信息，包括生成的 Triton/C++ 代码、融合决策、buffer 分配情况等。调试输出会保存在 `torch_compile_debug/` 目录下。
 
-**MINUGRAPHPREFIX** 是 Inductor 调试输出的文件前缀。每个编译过的子图 (subgraph) 会保存为独立的文件，方便逐个检查。
-
 **`torch._dynamo.explain()`** 可以分析为什么某个函数触发 graph break，帮助用户理解编译器的行为。
 
 ### 5.5 与 torch.export 的协同
@@ -641,7 +647,7 @@ Inductor 与 `torch.distributed` 深度集成，特别是与 FSDP (Fully Sharded
 
 3. **Inductor 的设计哲学是 eager-first 和 Python-first**。它不引入新的语言或 DSL，不要求用户修改模型代码，而是通过 `torch.compile()` 一行代码透明地提供编译优化。
 
-4. **编译栈由 Dynamo → FX → Inductor 三层组成**。Dynamo 负责追踪 Python 代码，FX 提供 Graph IR，Inductor 负责优化和代码生成。三者各司其职，形成清晰的 pipeline。
+4. **编译栈由 Dynamo → FX → AotAutograd → Inductor 四层组成**。Dynamo 负责追踪 Python 代码，FX 提供 Graph IR，AotAutograd 负责前向/反向图拆分，Inductor 负责优化和代码生成。各层各司其职，形成清晰的 pipeline。
 
 5. **语义等价性是不可违反的 invariant**。编译后的代码必须与 eager mode 产生完全相同的结果。这既是技术约束，也是用户信任的基石。
 
@@ -729,6 +735,7 @@ print(f"Speedup:  {eager_time / compiled_time:.2f}x")
 #   Speedup:  1.75x
 # 典型输出（GPU）：
 #   Speedup 可能在 2x-5x 之间，取决于模型和 GPU
+# 注意：以上数据仅供参考，实际加速比取决于模型结构和硬件
 ```
 
 **代码要点解析：**

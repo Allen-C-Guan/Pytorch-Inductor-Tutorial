@@ -170,24 +170,7 @@ try:
 
 ### 7.2.3 Loop Unrolling（循环展开）
 
-#### 原理
-
-Loop unrolling 将循环体复制多份以减少循环控制开销：
-
-```
-# 未展开
-for i in range(N):
-    A[i] = B[i] + C[i]
-
-# 展开因子 4
-for i in range(0, N, 4):
-    A[i]   = B[i]   + C[i]
-    A[i+1] = B[i+1] + C[i+1]
-    A[i+2] = B[i+2] + C[i+2]
-    A[i+3] = B[i+3] + C[i+3]
-```
-
-好处：减少分支预测开销、暴露指令级并行（ILP）。代价：增加代码体积（code bloat）和寄存器压力。在 GPU 上，Triton 编译器会自动处理 unrolling — Inductor 通过设置 `num_stages` 和 block size 来间接控制。
+Loop unrolling 将循环体复制多份以减少循环控制开销，好处是减少分支预测开销、暴露指令级并行（ILP）。代价是增加代码体积（code bloat）和寄存器压力。Inductor 本身不直接执行 unrolling——在 GPU 上，Triton 编译器在 MLIR 后端自动处理循环展开和软件流水线；在 CPU 上，C++ 编译器（GCC/Clang）负责向量化循环的自动展开。Inductor 通过设置 `num_stages`（流水线级数）和 block size 来间接影响下游编译器的 unrolling 决策。
 
 ### 7.2.4 Vectorization（向量化）
 
@@ -220,16 +203,7 @@ graph TD
 
 #### GPU 内存层次结构
 
-```mermaid
-graph TD
-    A["Global Memory (HBM)<br>~40GB, ~2TB/s, ~400 cycles"] --> B["L2 Cache<br>~40MB, ~10TB/s"]
-    B --> C["Shared Memory / L1<br>~192KB/SM, ~19TB/s, ~30 cycles"]
-    C --> D["Registers<br>~256KB/SM, ~1 cycle"]
-    style A fill:#f96,stroke:#333
-    style D fill:#9f6,stroke:#333
-```
-
-融合的收益来源于消除 A 层的访问（将中间结果保留在 D 层），tiling 的收益来源于将 A 层访问模式优化为通过 B/C 层。
+GPU 内存层次从慢到快为：Global Memory (HBM, ~400 cycles) → L2 Cache → Shared Memory/L1 (~30 cycles) → Registers (~1 cycle)。融合的收益来源于消除 Global Memory 层的访问（将中间结果保留在 Registers），tiling 的收益来源于将 Global Memory 访问模式优化为通过 L2/Shared Memory 层。
 
 ### 7.2.5 Register Pressure（寄存器压力）
 
@@ -315,10 +289,20 @@ Inductor 的调度器将一组 IR 节点（`BaseSchedulerNode`）组织成 kerne
 
 **Tiling** 采用基于 stride 分析的候选生成：从每个 MemoryDep 的索引表达式中提取 stride 信息，在 stride-1 边界处 split，然后通过评分筛选最优 tiling。
 
+**Autotuning** 是 tiling 决策的运行时优化层。静态分析选择的 tiling 候选在编译期只确定了维度的 split 方式（如 `{"y": M//64, "x": 64}`），而具体的 block 大小（`XBLOCK`、`YBLOCK` 等）由 Triton autotune 在运行时确定。Autotuning 的核心流程：
+
+1. **候选配置生成**：Inductor 为每个 kernel 生成一组候选配置（`triton.Config`），每个配置指定 `BLOCK_SIZE`、`num_warps`（线程束数）、`num_stages`（流水线级数）等参数。模板 kernel（如 matmul）的候选配置由 `template_heuristics/` 目录下的启发式类生成，包含针对不同 problem size 优化的参数组合。
+
+2. **基准测试与选择**：kernel 首次运行时，Triton 编译器对所有候选配置进行基准测试，选择运行时间最短的配置。测试结果缓存在本地文件（`autotune_local_cache`）或远程缓存（`autotune_remote_cache`）中，后续相同 shape 的 kernel 直接使用缓存结果。
+
+3. **与编译流水线的交互**：`TritonKernel` 的 `autotune_hints`（源码 `triton.py:2818`）收集编译期分析得到的信息（如 reduction 类型、元素数量提示），传递给 Triton 编译器以指导 autotune 搜索。`size_hints`（源码 `triton.py:5605`）将动态 shape 的优化提示传递给 autotune，缩小搜索空间。
+
+autotuning 的代价是增加首次编译时间（需要为每个候选配置编译并运行 kernel），但换来的是接近手写 kernel 的运行时性能。
+
 ### 7.3.3 Why：内存带宽是 ML 工作负载的瓶颈
 
 在现代 GPU 上，计算能力（FLOP/s）的增长速度远快于内存带宽（bytes/s）。以 NVIDIA H100 为例：
-- FP16 计算吞吐：~1979 TFLOP/s
+- FP16 算力：~1979 TFLOP/s
 - HBM 带宽：~3.35 TB/s
 
 对于一次 FP16 乘加（2 FLOP），只需读 2 个 FP16 值（4 bytes）。带宽能支持的计算量为 3.35e12 / 4 * 2 = 1675 TFLOP/s，仅为峰值算力的 85%。而对于更轻量的操作（如 elementwise add，1 FLOP / 8 bytes），带宽限制更为严重。
@@ -335,22 +319,53 @@ Inductor 的调度器将一组 IR 节点（`BaseSchedulerNode`）组织成 kerne
 | Tiling 候选 | 基于 stride-1 | stride-1 维度保证 coalesced access；简单且有效 |
 | 可配置启发式 | `InductorChoices` 子类 | 不同硬件/模型的最优策略不同，可扩展性关键 |
 
-### 7.3.5 与其他编译器的比较
+### 7.3.5 Template Fusion：模板匹配与 Epilogue 融合
 
-| 特性 | Inductor | XLA | TVM |
-|------|----------|-----|-----|
-| 融合策略 | 贪心 + 评分排序 | 基于代价模型的融合 | 手动 schedule primitive |
-| Tiling 决策 | stride-based 自动 | 自动 + XLA auto-tiling | 用户指定 tiling 结构 |
-| 可扩展性 | `InductorChoices` 子类 | `FusionPass` 自定义 | Pass infrastructure |
-| 融合粒度 | IR buffer 级别 | HLO instruction 级别 | Tensor compute 级别 |
+#### What：将子图匹配到预定义的高效 kernel 模板
 
-**XLA** 的融合通过 HLO instruction 的 producer-consumer 关系来确定，使用 cost model 估计融合收益。XLA 的 fusion 通常更保守，但代价模型更精确。
+Template Fusion 是 Inductor 中最重要的优化之一。当调度器发现 IR 子图匹配预定义的高效 kernel 模板（如矩阵乘法）时，该子图不走标准的 pointwise fusion 流水线，而是走一条专门的代码生成路径——使用手写优化的 Triton 模板，并将后续的 pointwise 操作融合到模板的 epilogue 中。
 
-**TVM** 采用 schedule primitive（如 `cache_read`、`compute_at`）让用户显式控制融合和 tiling，灵活但学习曲线陡峭。
+最典型的例子是 `matmul + bias_add + relu`。标准 pointwise fusion 会生成两个 kernel（一个 matmul kernel，一个 fused add+relu kernel），而 template fusion 将三者合并为一个 kernel 调用。
 
-**Halide** 的启发是 **schedule 与 algorithm 分离** — Inductor 沿用了这一哲学：IR 定义"做什么"，scheduler 决定"怎么做"。
+#### How：TritonTemplate → TritonTemplateKernel → Epilogue Fusion
 
-### 7.3.6 关键不变量
+代码路径涉及三个关键组件：
+
+```
+select_algorithm.py:
+  TritonTemplate (模板定义，如 mm_template)
+    → KernelTemplateChoice (封装模板参数)
+      → TritonTemplateCaller (IR 级别的选择调用器)
+
+triton.py:
+  TritonTemplateKernel (继承自 TritonKernel)
+    → 生成带 epilogue 的 Triton kernel
+
+scheduler.py:
+  FusedExternTritonKernelSchedulerNode
+    → epilogue_fuse() 将模板节点与后续 pointwise 节点合并
+```
+
+1. **模板匹配**（`select_algorithm.py`）：`TritonTemplate` 类（源码 `select_algorithm.py:2464`）是所有 Triton 模板的基类。每个模板有唯一的 `uid`（如 `triton::mm`）、grid 函数和 Jinja2 模板源码。`KernelTemplateChoice` 封装模板参数，在算法选择阶段与标准 pointwise 路径竞争。
+
+2. **Epilogue 融合**：`FusedExternTritonKernelSchedulerNode`（源码 `scheduler.py:2270`）通过 `epilogue_fuse()` 方法将模板节点（如 matmul）与紧随其后的 pointwise 节点合并。合并后，pointwise 操作的 IR 被注入到模板 kernel 的存储路径中——模板计算结果不写回 global memory，而是直接传递给 epilogue 的 pointwise 操作。
+
+3. **代码生成**：`TritonTemplateKernel`（源码 `select_algorithm.py:480`）继承自 `TritonKernel`，处理模板特有的参数（`num_stages`、`num_warps`、`epilogue_fn` 等）。它重写了标准的 load/compute/store 流程，使用预定义的 tile 大小和内存访问模式。
+
+#### Why：模板融合的性能收益
+
+模板融合的性能收益来自两方面：
+
+1. **消除中间 buffer**：与标准 pointwise fusion 相同，但更彻底——模板内部的 tiled loop 中间结果也留在寄存器/shared memory 中
+2. **手写优化模板**：matmul 模板使用经过深度优化的 tiled 算法（分块矩阵乘法），其内存访问模式和流水线设计远超自动生成的 pointwise kernel
+
+`FusionScore` 中 `template_score` 优先级最高的设计（7.4.2 节）正是为了确保模板融合优先于普通 fusion 执行。
+
+### 7.3.6 与其他编译器的比较
+
+Inductor 与其他 ML 编译器在融合策略上的关键差异：**XLA** 使用基于代价模型的融合，更保守但模型更精确；**TVM** 通过 schedule primitive 让用户显式控制融合和 tiling，灵活但学习曲线陡峭；**Halide** 的核心启发是 schedule 与 algorithm 分离——Inductor 沿用了这一哲学，IR 定义"做什么"，scheduler 决定"怎么做"。Inductor 的独特之处在于：全栈 Python 实现、通过 `InductorChoices` 子类实现运行时可配置的启发式策略。
+
+### 7.3.7 关键不变量
 
 **融合永远不改变语义，只改变性能。** 这是 Inductor 融合策略的基本安全保证。具体体现为：
 - `can_fuse()` 检查中，所有条件都是性能/合法性约束，不涉及数值语义
@@ -581,7 +596,14 @@ class ForeachKernelSchedulerNode(FusedSchedulerNode):
 
 **编译器映射**：对应 PyTorch 的 `torch._foreach_*` 系列操作 — 将多个独立的 tensor 操作（如 `[a + 1, b + 2, c + 3]`）打包到一个 kernel 中，减少 kernel launch overhead。
 
-**设计决策**：要求 producer 和 consumer 的 snodes 列表长度相等且一一对应可融合，保证每个子操作独立正确。
+**Horizontal Fusion 的实现机制**：`ForeachKernelSchedulerNode` 实现了 Inductor 中的 horizontal（横向）融合。与 vertical fusion 的 producer-consumer 关系不同，horizontal fusion 面对的是**互不依赖的并行操作**。其收益不是消除中间 buffer（因为操作之间没有数据依赖），而是：
+
+1. **减少 kernel launch overhead**：每次 kernel 启动涉及驱动程序调用、参数设置等固定开销（约 5-10us），将多个小操作合并到一个 kernel 可以均摊此开销
+2. **共享内存访问**：如果多个操作读取相同的输入 tensor（如同一个 weight matrix），合并后只需从 global memory 读取一次
+
+代码生成时，`ForeachKernelSchedulerNode` 会标记 `is_combo_kernel=True`（源码 `triton.py:2790`），TritonKernel 使用不同的代码生成策略——将每个子操作的 load/compute/store 顺序排列在同一个 kernel 函数中，通过 flattened dispatch 调度多个子 kernel。
+
+**设计决策**：要求 producer 和 consumer 的 snodes 列表长度相等且一一对应可融合，保证每个子操作独立正确。`can_fuse()` 的三维检查逻辑（源码 `scheduler.py:2366`）处理了 foreach-foreach、普通-foreach、foreach-普通三种组合情况。
 
 #### CandidateTiling — Tiling 候选方案
 

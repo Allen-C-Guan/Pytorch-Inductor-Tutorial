@@ -54,14 +54,14 @@ Inductor 的代码生成分为两大部分：
 
 **示例**：考虑表达式树 `a[i] + b[i] * c[i]`，在 RISC-V 目标上，我们有以下指令模式：
 
-| 模式 | IR 子树 | 代价 |
+| 模式 | IR 子树 | 代价（延迟周期） |
 |------|---------|------|
 | `lw` | `load(addr)` | 1 |
-| `mul` | `mul(a, b)` | 1 |
-| `add` | `add(a, b)` | 1 |
-| `fmadd` | `add(a, mul(b, c))` | 2 |
+| `mul` | `mul(a, b)` | 3 |
+| `add` | `add(a, b)` | 2 |
+| `fmadd` | `add(a, mul(b, c))` | 4 |
 
-最小代价覆盖使用 `fmadd`（代价 2）而非 `mul + add`（代价 2，但 `fmadd` 延迟更低）。
+最小代价覆盖使用 `fmadd`（代价 4），而非 `mul + add`（代价 3+2=5）。`fmadd` 虽然指令数与 `mul + add` 相同（1 vs 2），但总延迟更低，因为它将乘法和加法融合为一条流水线化的指令，消除了 `mul` 结果写回寄存器再被 `add` 读取的等待周期。这正是"最小代价覆盖"在指令选择中的核心价值。
 
 #### 树模式匹配 vs DAG 模式匹配
 
@@ -88,114 +88,11 @@ Inductor 的 `OpOverrides` 类正是这种重写规则的实现载体。`TritonO
 
 #### 经典算法详解
 
-**1. Maximal Munch（最大匹配）**
+**1. Maximal Munch（最大匹配）**：自顶向下的贪心算法，每步选择能匹配当前节点的最大（最深）模式，然后递归处理未被覆盖的子节点。优点是简单、$O(n)$ 复杂度；缺点是不保证全局最优（贪心选择可能错过更优的全局覆盖）。常用于快速原型和 JIT 编译器。**Inductor 不使用此算法。**
 
-Maximal Munch 是一种自顶向下的贪心算法：
+**2. Dynamic Programming（动态规划指令选择）**：自底向上计算每个子树的最小代价覆盖，状态为 $cost(v, t)$（以节点 $v$ 为根、翻译为类型 $t$ 的最小代价），利用最优子结构保证全局最优。复杂度 $O(n \times \|patterns\| \times \|types\|^k)$。GCC 和 LLVM 的指令选择阶段使用此方法。**Inductor 不使用此算法。**
 
-```
-算法 MaximalMunch(tree T):
-    选择能匹配 T 根节点的最大模式 p
-    将 p 的子模式参数递归应用于 T 的子树
-    返回 p 覆盖的指令序列
-```
-
-伪代码：
-
-```
-def maximal_munch(node, patterns):
-    # 找到能匹配 node 的最大（最深）模式
-    best_pattern = None
-    for pattern in patterns:
-        if pattern.matches(node):
-            if best_pattern is None or pattern.depth > best_pattern.depth:
-                best_pattern = pattern
-    
-    if best_pattern is None:
-        raise Error("No pattern matches node")
-    
-    # 生成指令
-    instructions = [best_pattern.emit(node)]
-    
-    # 递归处理未被 best_pattern 覆盖的子节点
-    for child in best_pattern.uncovered_children(node):
-        instructions.extend(maximal_munch(child, patterns))
-    
-    return instructions
-```
-
-**不保证最优的例子**：考虑 `(a + b) + c`，假设有两种模式：
-- `add(add(a, b), c)` → 代价 3（两次独立加法）
-- `add3(a, b, c)` → 代价 1（三操作数加法指令）
-
-Maximal Munch 可能先匹配 `add` 在根节点，然后对子树 `a + b` 再次匹配 `add`，总代价 2。但如果存在 `add3` 模式且它能匹配整棵树，代价只有 1。Maximal Munch 的贪心策略可能错过这个更优选择。
-
-**复杂度**：$O(n)$ 其中 $n$ 是树的大小，因为每个节点恰好处理一次。
-
-**2. Dynamic Programming（动态规划指令选择）**
-
-DP 方法自底向上计算每个子树的最小代价覆盖：
-
-**状态定义**：$cost(v, t)$ 表示以节点 $v$ 为根、将 $v$ 翻译为类型 $t$ 的子树的最小代价。
-
-**转移方程**：
-
-$$cost(v, t) = \min_{p \in \text{matches}(v,t)} \left\{ c(p) + \sum_{i=1}^{k} \min_{t'} cost(child_i(v), t') \right\}$$
-
-其中 $k$ 是模式 $p$ 的子模式数量，$c(p)$ 是模式 $p$ 的代价。
-
-**最优子结构证明**：如果 $cost(v, t)$ 的最优解使用了模式 $p$，那么 $p$ 的每个子模式的覆盖也必须是对应子树的最优覆盖。否则可以替换为更优的子覆盖，得到更优的全局解，与最优性矛盾。
-
-**完整伪代码**：
-
-```
-def dp_instruction_select(tree T, patterns):
-    # 自底向上遍历
-    result = {}  # node -> {type -> (min_cost, best_pattern)}
-    
-    for node in postorder(T):  # 后序遍历：先子节点后父节点
-        result[node] = {}
-        for t in types:
-            min_cost = infinity
-            best_pattern = None
-            for p in patterns:
-                if p.matches(node, t):
-                    cost = p.cost
-                    for i, child in enumerate(p.children(node)):
-                        child_type = p.child_type(i)
-                        cost += result[child][child_type].min_cost
-                    if cost < min_cost:
-                        min_cost = cost
-                        best_pattern = p
-            result[node][t] = (min_cost, best_pattern)
-    
-    # 自顶向下重建指令序列
-    return reconstruct(T.root, target_type, result)
-```
-
-**与 Maximal Munch 的对比**：
-
-| 特性 | Maximal Munch | Dynamic Programming |
-|------|--------------|---------------------|
-| 最优性 | 不保证 | 保证全局最优 |
-| 方向 | 自顶向下 | 自底向上 |
-| 复杂度 | $O(n)$ | $O(n \times \|patterns\| \times \|types\|^k)$ |
-| 实现复杂度 | 简单 | 中等 |
-| 实际应用 | 快速原型、JIT | GCC、LLVM (指令选择阶段) |
-
-**3. 树文法 (Tree Grammar)**
-
-树文法将指令选择统一到形式语言理论框架下：
-
-- **终结符**：目标机器的指令
-- **非终结符**：IR 中的操作类型（如 `reg`, `const`, `addr`）
-- **产生式规则**：每条指令对应一条产生式，例如：
-  - `reg → add(reg, reg)` 代价 1
-  - `reg → load(addr)` 代价 2
-  - `reg → const(int)` 代价 0
-- **覆盖 = 推导**：对 IR 树的一次指令选择对应树文法的一个推导
-- **代价 = 推导的总代价**
-
-最优指令选择等价于寻找树文法中代价最小的推导。
+**3. 树文法 (Tree Grammar)**：将指令选择统一为形式语言理论中的最小代价推导问题——每条指令对应一条产生式规则（如 `reg → add(reg, reg)` 代价 1），最优指令选择等价于寻找代价最小的推导。Inductor 的 `OpOverrides` 方法分派可以类比为一种退化的树文法匹配——每个 `ops.xxx` 方法就是一条"产生式规则"，但 Inductor 不做代价比较，而是通过硬编码的模式映射直接选择目标代码。
 
 #### Inductor 的"指令选择"与传统编译器的对比
 
@@ -212,102 +109,11 @@ def dp_instruction_select(tree T, patterns):
 
 #### GPU 编程模型
 
-**CUDA 编程模型回顾**：
-
-```
-Grid (整个计算任务)
- └── Block (SM 上调度执行的一组线程)
-      └── Warp (32 个线程，锁步执行)
-           └── Thread (单个执行单元)
-```
-
-- **Grid**：整个 kernel 启动的线程集合，组织为三维网格
-- **Block**：在同一个 SM（流式多处理器）上执行的线程组，共享 shared memory
-- **Warp**：32 个线程组成的调度单位，执行相同指令（SIMT）
-- **Thread**：拥有独立寄存器的执行单元
-
-**GPU 内存层次**：
-
-```
-Global Memory (HBM, 大容量高延迟 ~100ns)
- └── L2 Cache (硬件管理)
-      └── Shared Memory (Block 级显式管理, ~1ns)
-           └── Registers (Thread 级, ~0.1ns)
-```
-
-**Triton 的 Block-level 编程抽象**：
-
-Triton 提供了比 CUDA 更高级的抽象。程序员不需要管理线程，而是以 **block** 为单位编程：
-
-- **Block**：Triton 中的一个"程序"(program)，等价于 CUDA 中的一个 thread block
-- **`tl.program_id(axis)`**：获取当前 program 在 grid 中的索引（等价于 `blockIdx.x`）
-- **隐式 SIMT**：Triton 的一个变量实际上代表 block 中所有线程的数据，编译器自动映射到线程
-
-```python
-# Triton kernel 示例
-@triton.jit
-def add_kernel(x_ptr, y_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)  # 当前 program 的 ID
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)  # block 内的偏移
-    mask = offsets < n_elements
-    x = tl.load(x_ptr + offsets, mask=mask)  # 从 global memory 加载
-    y = tl.load(y_ptr + offsets, mask=mask)
-    output = x + y                           # 逐元素计算
-    tl.store(output_ptr + offsets, output, mask=mask)  # 写回 global memory
-```
-
-**Triton 与 CUDA 的关系和区别**：
-
-| 维度 | CUDA | Triton |
-|------|------|--------|
-| 编程单位 | Thread | Block (Program) |
-| 索引管理 | 手动 `threadIdx` + `blockIdx` | 自动 `tl.arange` |
-| 内存管理 | 手动 shared memory | 自动（编译器优化） |
-| 同步 | 手动 `__syncthreads()` | 自动（block 级隐式） |
-| 编译路径 | NVCC → PTX → Cubin | Python → MLIR → LLVM IR → PTX → Cubin |
-
-**为什么 Inductor 选择 Triton**：Triton 让 Inductor 避免了手动管理线程索引、shared memory 和同步的低级细节，同时仍能生成性能接近手写 CUDA 的代码。这对编译器生成代码至关重要——编译器自动化的模式比手动线程管理更适合自动化代码生成。
+**CUDA 与 Triton 的简要回顾**：CUDA 的执行层次为 Grid → Block → Warp (32 线程) → Thread，内存层次为 Global Memory (HBM) → L2 Cache → Shared Memory → Registers。Triton 将编程抽象提升到 block 级别——程序员以 `tl.program_id()` 标识的 program 为单位编程，无需手动管理线程索引和同步，Triton 编译器自动将 block 级操作映射到硬件线程。编译路径为 Python → MLIR → LLVM IR → PTX → Cubin。这种 block-level 抽象是 Inductor 选择 Triton 的核心原因：编译器自动化的模式比手动线程管理更适合代码生成。
 
 #### C++ 向量化
 
-**SIMD 指令概念**：
-
-SIMD（Single Instruction Multiple Data）允许一条指令同时处理多个数据元素：
-
-- **SSE**（x86）：128 位寄存器，4 个 float
-- **AVX/AVX2**（x86）：256 位寄存器，8 个 float
-- **AVX-512**（x86）：512 位寄存器，16 个 float
-- **NEON**（ARM）：128 位寄存器，4 个 float
-
-**向量化循环的代码结构**：
-
-```cpp
-// 标量循环
-for (int i = 0; i < n; i++) {
-    out[i] = a[i] + b[i];
-}
-
-// 向量化循环 (AVX, 8 floats per vector)
-int vec_n = n / 8 * 8;
-for (int i = 0; i < vec_n; i += 8) {
-    __m256 va = _mm256_loadu_ps(a + i);
-    __m256 vb = _mm256_loadu_ps(b + i);
-    __m256 vout = _mm256_add_ps(va, vb);
-    _mm256_storeu_ps(out + i, vout);
-}
-// 尾部处理
-for (int i = vec_n; i < n; i++) {
-    out[i] = a[i] + b[i];
-}
-```
-
-**Mask 向量化 vs 全向量化**：
-
-- **全向量化**：循环迭代次数是向量宽度的整数倍，无需处理尾部
-- **Mask 向量化**：使用 mask 寄存器处理不对齐的尾部迭代（AVX-512 的 `__mmask16`）
-
-Inductor 的 C++ 后端在 `CppKernel` 中自动生成向量化的循环结构，由 `cpp_builder` 模块检测当前 CPU 支持的 ISA 级别。
+SIMD（Single Instruction Multiple Data）允许一条指令同时处理多个数据元素。现代 CPU 支持 SSE（128 位，4 float）、AVX/AVX2（256 位，8 float）、AVX-512（512 位，16 float）和 NEON（ARM，128 位）。Inductor 的 C++ 后端**不手动使用 SIMD intrinsics**（如 `_mm256_add_ps`），而是生成标准的 C++ 循环代码（如 `out[i] = a[i] + b[i]`），由 `cpp_builder` 模块检测当前 CPU 支持的 ISA 级别，编译时通过 GCC/Clang 的自动向量化（`-O3 -march=native`）将标量循环转换为 SIMD 指令。这种设计避免了手动 intrinsics 的可移植性问题，同时仍能获得接近手写 SIMD 的性能。
 
 ### 8.2.2 算法背景
 
@@ -562,6 +368,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 | `fixed_config` | `FixedTritonConfig \| None` | autotuning 确定的 block 配置 |
 | `autotune_hints` | `OrderedSet[AutotuneHint]` | 传递给 Triton 编译器的 autotune 提示 |
 
+**Block Pointer 优化**：`TritonKernel` 的 `allow_block_ptr = True`（源码 `triton.py:2775`）启用 Triton 2.x 的 `tl.make_block_ptr()` API。Block pointer 将 tiling 后的指针管理（offset 计算、boundary check、advance）封装为 `tl.make_block_ptr()` / `tl.load()` / `tl.advance()` 三步操作，替代手动计算 `ptr + offset` + mask 的方式。当 `config.triton.use_block_ptr` 为 True 且 IR 节点的索引模式兼容时（不支持 indirect indexing），`BlockPtrOptions` 类（源码 `triton.py:714`）自动生成 block pointer 调用。该优化可以简化生成的代码，并为 Triton 编译器提供更多优化空间（如 TMA——Tensor Memory Accelerator 的利用）。
+
 **Grid 计算**：
 
 Triton kernel 的 grid（启动配置）由 `tiling` 中的 block 大小决定：
@@ -600,7 +408,48 @@ sequenceDiagram
     S->>S: _emit_kernel_to_wrapper() 写入 wrapper
 ```
 
-### 8.4.4 CppKernel：CPU Kernel 的代码生成
+**Autotuning 机制**（`triton.py:5597` `codegen_kernel`）：
+
+TritonKernel 的代码生成内嵌了 autotuning 基础设施。`codegen_kernel()` 方法在生成 kernel 源码时，同时生成 autotuning 所需的元数据：
+
+1. **`size_hints`**（源码 `triton.py:5605`）：对每个 tiling 维度，通过 `optimization_hint()` 获取 numel 的运行时估值，再取 `next_power_of_2` 得到候选 block size 的上界。这缩小了 autotune 的搜索空间。
+
+2. **`autotune_hints`**（源码 `triton.py:2818`）：`OrderedSet[AutotuneHint]`，在 IR 解释过程中逐步收集。例如，当检测到只有一个元素 per thread 时，添加 `AutotuneHint.ONE_ELEMENT_PER_THREAD`，提示 Triton 编译器缩小搜索范围。
+
+3. **配置候选生成**：在 `triton_heuristics` 模块中，`heuristics_for_device()` 根据设备类型和 kernel 类型（pointwise / reduction / mm）生成候选配置列表。每个 `triton.Config` 指定 `XBLOCK`、`num_warps`、`num_stages` 等参数的组合。
+
+4. **缓存机制**：autotune 结果通过 `autotune_local_cache`（默认开启）缓存到本地文件，后续相同 shape 的 kernel 直接复用。`autotune_remote_cache` 支持跨机器共享缓存。当缓存命中时，跳过 benchmark 阶段，编译时间从秒级降到毫秒级。
+```
+
+### 8.4.4 TritonTemplateKernel：模板 Kernel 的代码生成
+
+**源码位置**：`torch/_inductor/select_algorithm.py:480`
+
+```python
+class TritonTemplateKernel(TritonKernel):
+    """A specialized kernel class for Triton templates that handles
+    code generation for templated Triton kernels."""
+    def __init__(self, kernel_name, input_nodes, output_node, defines,
+                 num_stages, num_warps, grid_fn, meta, call_sizes, ...):
+```
+
+**与标准 TritonKernel 的关键区别**：
+
+`TritonTemplateKernel` 是为模板匹配操作（如矩阵乘法）设计的专用代码生成路径。它继承自 `TritonKernel`，但有以下核心差异：
+
+1. **预定义的 tile 大小**：标准 `TritonKernel` 通过 autotune 搜索 block size；`TritonTemplateKernel` 使用模板中硬编码的 tile 配置（`BLOCK_M`、`BLOCK_N`、`BLOCK_K`），这些值经过针对特定操作的手动优化。
+
+2. **Jinja2 模板驱动**：标准路径通过 `OpOverrides` 逐节点翻译 IR；模板路径使用 Jinja2 模板（如 `templates/triton_mm.py.jinja`）直接生成完整的 Triton kernel 源码，kernel 结构在模板中固定。
+
+3. **Epilogue/Prologue 注入**：通过 `epilogue_fn` 参数（源码 `select_algorithm.py:508`），pointwise 操作（如 ReLU、bias add）的代码被注入到模板 kernel 的存储路径中，实现 epilogue fusion。
+
+4. **`TritonTemplate` 类**（源码 `select_algorithm.py:2464`）：管理模板的生命周期——`name`（模板名如 `"mm"`）、`grid`（grid 函数）、`source`（Jinja2 模板源码）。`uid` 属性（如 `"triton::mm"`）在算法选择阶段标识模板。
+
+模板路径在 `InductorChoices.get_template_configs()` 中与标准 pointwise 路径竞争，由 `template_heuristics/` 下的启发式类生成候选配置参数。
+
+**Combo Kernel 机制**：`TritonKernel` 的 `is_combo_kernel` 参数（源码 `triton.py:2790`）控制 combo kernel 的代码生成。Combo kernel 将多个独立的 fused operation（来自 `ForeachKernelSchedulerNode`）打包到同一个 Triton kernel 函数中。与标准 fusion 不同，combo kernel 内的子操作之间没有数据依赖，它们共享同一个 kernel 启动，但各自有独立的 load/compute/store 代码段。代码生成时使用 flattened dispatch——通过单个 `tl.program_id()` 计算出当前 block 应执行哪个子操作（源码 `triton.py:6118`），并跳转到对应的代码路径。当 `config.combo_kernels_autotune > 0` 时，combo kernel 还会对其分区策略进行 autotune，寻找最优的子操作分组方案。
+
+### 8.4.5 CppKernel：CPU Kernel 的代码生成
 
 **源码位置**：`torch/_inductor/codegen/cpp.py:2000`
 
@@ -655,7 +504,7 @@ class CppOverrides(OpOverrides):
         return f"{a} ? {b} : {c}"
 ```
 
-### 8.4.5 KernelArgs：参数管理
+### 8.4.6 KernelArgs：参数管理
 
 **源码位置**：`torch/_inductor/codegen/common.py:1556`
 
@@ -681,7 +530,7 @@ class KernelArgs:
 
 `_lookup` 方法（源码 `common.py:1558`）实现了惰性分配：第一次引用某个 buffer 时才分配参数名，确保参数名紧凑连续。
 
-### 8.4.6 CSE：Kernel 内公共子表达式消除
+### 8.4.7 CSE：Kernel 内公共子表达式消除
 
 **源码位置**：`torch/_inductor/codegen/common.py:1952`
 
@@ -718,7 +567,7 @@ def generate(self, buffer, expr, *, bounds=..., write=True, assignment=True, ...
 
 **设计决策**：使用字符串作为缓存键而非 AST 节点，因为：(a) Python 字符串比较是 O(n) 但常数因子极低；(b) 避免了 AST 节点的 hash 冲突问题；(c) 简单直接，适合 Inductor 的代码生成场景。
 
-### 8.4.7 PythonWrapperCodegen：Wrapper 代码生成
+### 8.4.8 PythonWrapperCodegen：Wrapper 代码生成
 
 **源码位置**：`torch/_inductor/codegen/wrapper.py:1240`
 
@@ -754,7 +603,7 @@ wrapper.py 文件结构:
 2. 检查是否可以复用已释放的 buffer（通过 `buffer_reuse_key` 匹配设备、dtype、大小）
 3. 对原地操作，使用 `inplace_buffers` 共享输入/输出参数
 
-### 8.4.8 IndentedBuffer：代码输出缓冲区
+### 8.4.9 IndentedBuffer：代码输出缓冲区
 
 **源码位置**：`torch/_inductor/utils.py:1468`
 
@@ -891,7 +740,7 @@ def triton_poi_add_kernel(
 ):
     # === Prologue: 计算 block offset 和 mask ===
     xoffset = tl.program_id(0) * BLOCK_SIZE  # 当前 block 的起始偏移
-    xindex = xoffset + tl.arange(0, BLOCK_SIZE)[:]  # block 内所有偏移
+    xindex = xoffset + tl.arange(0, BLOCK_SIZE)  # block 内所有偏移（注：[:] 为简化表示，实际生成代码可能有差异）
     xmask = xindex < ks0  # boundary mask
 
     # === Loads: 从 global memory 加载数据 ===
@@ -1062,43 +911,7 @@ def matmul_kernel(
 
 ### 8.7.1 Kernel 代码生成的 Sequence Diagram
 
-```mermaid
-sequenceDiagram
-    participant Sch as Scheduler
-    participant TS as TritonScheduling
-    participant TK as TritonKernel
-    participant CSE as CSEProxy
-    participant TO as TritonOverrides
-    participant PW as PythonWrapperCodegen
-
-    Sch->>TS: codegen_node(node_schedule)
-    TS->>TS: _select_kernel_config() (autotune)
-    TS->>TK: TritonKernel(tiling, fixed_config)
-    TK->>TK: codegen_range_tree() 初始化迭代空间
-    TS->>TK: call_kernel(kernel_name, node_schedule)
-    
-    loop 每个 FusedSchedulerNode
-        TK->>CSE: set_current_node(node)
-        CSE->>TO: ops.load(buf, index)
-        TO->>TK: writes to loads buffer
-        Note over TK: tl.load(ptr + index, mask=...)
-        
-        loop 每个 compute op
-            CSE->>TO: ops.xxx(args)
-            TO->>TK: writes to compute buffer
-            Note over TK: tmp = expression
-        end
-        
-        CSE->>TO: ops.store(buf, index, val)
-        TO->>TK: writes to stores buffer
-        Note over TK: tl.store(ptr + index, val, mask=...)
-    end
-    
-    TK->>TS: codegen_body() → kernel src code
-    TS->>PW: define_kernel(name, src_code)
-    TS->>PW: call_kernel(name, args) → wrapper line
-    PW->>PW: 生成 grid 计算和 kernel 启动代码
-```
+> 8.4.3 节已展示了 TritonKernel 代码生成的完整 sequence diagram（Scheduler → TritonScheduling → TritonKernel → CSEProxy → TritonOverrides → PythonWrapperCodegen）。此处不再重复。
 
 ### 8.7.2 Triton Kernel 结构的 Flowchart
 
@@ -1195,7 +1008,7 @@ def triton_poi_fused_add_relu_0(
     # ========== PROLOGUE: 计算索引和 mask ==========
     # 每个 program 处理一个 XBLOCK 大小的 tile
     xoffset = tl.program_id(0) * XBLOCK
-    xindex = xoffset + tl.arange(0, XBLOCK)[:]
+    xindex = xoffset + tl.arange(0, XBLOCK)  # 注：[:] 为简化表示
     xmask = xindex < ks0  # 处理尾部不对齐
 
     # ========== LOADS: 从 global memory 读取 ==========

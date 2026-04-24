@@ -24,22 +24,12 @@
 
 #### 字节码作为"中间语言"（*EaC* Ch.2-3 类比）
 
-传统编译器的前端从源代码文本开始，经过**词法分析**（Lexical Analysis）和**语法分析**（Syntax Analysis）构建抽象语法树（AST）。Dynamo 的策略不同：它不解析 Python 源代码，而是分析 Python **字节码**（Bytecode）。
-
-为什么要从字节码开始？
+Dynamo 不解析 Python 源代码，而是分析 CPython 已经编译好的**字节码**（Bytecode）。虽然传统编译器前端从源码经词法/语法分析构建 AST，但 Dynamo 选择字节码是因为：字节码比 AST 更完整（包含闭包、异常处理等运行时信息）、更精确（直接对应 VM 执行行为）且更稳定。
 
 ```
 传统编译器前端：  源代码 → 词法分析 → Token流 → 语法分析 → AST
-Dynamo 前端：    Python 源代码 → CPython 编译器 → 字节码 → Dynamo 分析
+Dynamo 前端：    Python 源代码 → CPython 编译器 → 字节码 → Dynamo 符号执行
 ```
-
-Python 代码在执行前已经被 CPython 编译为字节码（`code object`）。字节码是一个扁平的指令序列，每条指令包含操作码（opcode）和可选参数。这相当于传统编译器中词法分析和语法分析已经由 CPython 完成，Dynamo 只需要处理"后处理"后的结果。
-
-**为什么选择字节码而非 AST？**
-
-1. **完整性**：字节码包含了所有运行时信息（闭包、生成器、异常处理），而 AST 可能丢失某些语义
-2. **稳定性**：字节码格式相对稳定，Python 版本间的变化可以追踪
-3. **精确性**：字节码直接对应 Python 虚拟机的执行行为，不存在 AST 到实际行为之间的鸿沟
 
 #### 图 IR 设计原则（*EaC* Ch.4）
 
@@ -57,34 +47,75 @@ FX Graph 的设计选择：
 - **无显式控制流图（CFG）**：FX Graph 假设控制流已经被 Dynamo 展平
 - **类 SSA 语义**：每个 Node 的 `name` 是唯一的，类似于 SSA 中的虚拟寄存器
 
+#### VariableTracker 类型系统
+
+Dynamo 在符号执行过程中，需要为每个 Python 值维护一个符号化的表示。`VariableTracker`（`torch/_dynamo/variables/base.py`）就是这个类型系统的基类。InstructionTranslator 的虚拟栈 `stack` 和局部变量表 `symbolic_locals` 中存放的都是 `VariableTracker` 实例。
+
+**What**：VariableTracker 是 Dynamo 对 Python 值的抽象表示。每个子类对应一种 Python 对象类别，封装了该类别在符号执行中的行为。
+
+**How**：通过 `VariableTracker.build(tx, value, source=...)` 工厂方法，Dynamo 根据 Python 值的类型自动分派到合适的子类。带 `source` 参数的值经由 `VariableBuilder` 处理（需要生成 Guard），无 source 的临时值经由 `SourcelessBuilder` 处理。
+
+**Why**：统一的类型抽象使得 Dynamo 的指令处理逻辑可以不关心具体 Python 类型，而是通过 `call_function()`、`call_method()`、`var_getattr()` 等多态方法处理所有值。
+
+```mermaid
+classDiagram
+    class VariableTracker {
+        +source: Source
+        +guards: list
+        +mutation_type: MutationType
+        +call_function(tx, args)
+        +call_method(tx, method, args)
+        +var_getattr(tx, name)
+        +as_proxy()
+        +reconstruct(codegen)
+    }
+
+    class TensorVariable {
+        +proxy: fx.Proxy
+        +dtype/device/shape
+    }
+
+    class ConstantVariable {
+        +value: int|float|str|...
+    }
+
+    class ListVariable {
+        +items: list~VariableTracker~
+    }
+
+    class DictVariable {
+        +items: dict
+    }
+
+    class UserFunctionVariable {
+        +fn: Callable
+    }
+
+    class NNModuleVariable {
+        +module: nn.Module
+    }
+
+    VariableTracker <|-- TensorVariable
+    VariableTracker <|-- ConstantVariable
+    VariableTracker <|-- ListVariable
+    VariableTracker <|-- DictVariable
+    VariableTracker <|-- UserFunctionVariable
+    VariableTracker <|-- NNModuleVariable
+```
+
+核心子类的职责：`TensorVariable` 追踪 tensor 操作并生成 FX proxy；`ConstantVariable` 表示不可变的 Python 常量；`ListVariable`/`DictVariable` 追踪容器类型的元素级变化；`UserFunctionVariable` 处理用户定义函数的内联或 graph break 决策；`NNModuleVariable` 表示 `nn.Module` 实例的属性访问和方法调用。
+
+#### Source 系统：值来源追踪
+
+每个 VariableTracker 实例都可能携带一个 `source` 属性（定义在 `torch/_dynamo/source.py`），它记录了该值在原始 Python 代码中的出处。Source 对象是 Guard 生成的基础——Dynamo 通过 Source 知道"在运行时应该检查什么"。
+
+核心 Source 类型包括：`LocalSource`（局部变量）、`GlobalSource`（全局变量）、`AttrSource`（对象属性访问，如 `self.weight`）、`GetItemSource`（下标访问，如 `x[0]`）。Source 可以链式组合，例如 `AttrSource(LocalSource('self'), 'weight')` 表示 `self.weight`。Guard 的生成过程本质上就是 `source.make_guard(GuardBuilder.TYPE_MATCH)` 这样的调用链。
+
 #### Guard 机制：投机编译的理论基础
 
-Guard 是 Dynamo 实现安全 JIT 编译的核心机制。其理论基础是**投机优化**（Speculative Optimization）：
+（第一章已概述，此处展开实现细节）
 
-1. **假设**：编译时假设某些条件成立（如输入 tensor 的 dtype 和 shape）
-2. **Guard**：在运行时检查这些假设
-3. **命中（Hit）**：假设成立，执行编译后的代码
-4. **未命中（Miss）**：假设不成立，回退到 eager mode 并可能重新编译
-
-这类似于 CPU 的分支预测——编译器基于当前的类型/shape 信息做优化，如果运行时情况变了就"撤销"并重做。
-
-```
-┌────────────────────────────────────────────┐
-│          Guard 检查流程                     │
-│                                            │
-│  输入到达 → 检查 Guard 条件                 │
-│               │                            │
-│        ┌──────┴──────┐                     │
-│        ↓             ↓                     │
-│    Guard 通过     Guard 失败               │
-│        │             │                     │
-│  执行编译代码   回退到 eager mode           │
-│  (快速路径)     触发重新编译               │
-│                      │                     │
-│               生成新的 Guard               │
-│               编译新版本代码                │
-└────────────────────────────────────────────┘
-```
+Guard 的运行时检查由 C++ 实现的 `GuardManager` 完成，分为三层：`RootGuardManager`（根管理器，包含多个 GuardAccessor）、`GuardAccessor`（按 value source 组织）和 `LeafGuard`（具体检查，如 TYPE_MATCH, TENSOR_MATCH 等）。Guard 的生成过程基于 Source 对象：`source.make_guard(GuardBuilder.TYPE_MATCH)` 这样的调用链将值的来源信息转化为运行时检查条件。这种层次结构使得 guard 检查的开销在纳秒级别，对运行时性能几乎无影响。
 
 ### 2.2 算法背景
 
@@ -335,11 +366,9 @@ sequenceDiagram
 
 ### Eager-first：Graph Break 作为安全阀
 
-Graph break 是 Dynamo 设计中最关键的工程决策。它确保了：
+（第一章已概述，此处展开实现细节）
 
-1. **完整性**：任何 Python 代码都能通过 Dynamo，即使部分回退到 eager mode
-2. **正确性**：编译后的子图产生与 eager mode 完全相同的结果
-3. **渐进性**：用户可以逐步消除 graph break，提升编译覆盖率
+Graph break 的具体实现涉及 `InstructionTranslator` 中的 `unimplemented()` 调用。当 Dynamo 遇到无法安全追踪的操作时，会调用 `compile_subgraph()` 将当前已构建的 FX 子图提交给后端编译器，然后生成一个 resume 函数用于在 eager mode 执行完不支持的操作后恢复编译追踪。`livevars_analysis()` 确定在 graph break 点需要保存的活跃变量集合。
 
 查看 graph break 的工具：
 
@@ -352,16 +381,6 @@ print(f"Graph breaks: {explanation.graph_break_count}")
 for gb in explanation.graph_break_reasons:
     print(f"  Reason: {gb}")
 ```
-
-### Guard 系统：C++ 级别的快速检查
-
-Guard 的运行时检查由 C++ 实现的 `GuardManager` 完成，分为三层：
-
-1. **RootGuardManager** — 根管理器，包含多个 GuardAccessor
-2. **GuardAccessor** — 按 value source 组织（如 "local variable x"）
-3. **LeafGuard** — 具体的检查（TYPE_MATCH, TENSOR_MATCH 等）
-
-这种层次结构使得 guard 检查的开销在纳秒级别，对运行时性能几乎无影响。
 
 ### 开发者体验
 
@@ -388,9 +407,10 @@ def my_debug_function(x):
 
 1. **字节码符号执行**：Dynamo 不解析源代码，而是通过符号执行 Python 字节码来捕获计算逻辑，这比 AST 分析更精确
 2. **FX Graph**：轻量级图 IR，六种操作码，双向链表实现，Node 间的 `_input_nodes`/`users` 形成 use-def 链
-3. **Guard 机制**：投机编译的安全保障，C++ GuardManager 提供纳秒级检查
-4. **Graph Break**：遇到不支持的操作时优雅降级，保证任何 Python 代码都能通过 Dynamo
-5. **VariableTracker**：Dynamo 通过此抽象追踪 Python 值的符号表示
+3. **VariableTracker**：Dynamo 的类型系统基类，为每种 Python 对象提供符号化的追踪能力
+4. **Source 系统**：追踪值在原始代码中的出处，是 Guard 生成的基础
+5. **Guard 机制**：投机编译的安全保障，C++ GuardManager 提供纳秒级检查
+6. **Graph Break**：遇到不支持的操作时优雅降级，通过 `compile_subgraph()` + resume 函数实现子图切换
 
 **与下一章的衔接：** 下一章将深入 Inductor 的中间表示设计——IRNode、Buffer、Pointwise、Reduction 等核心数据结构，这些是 Inductor 编译器的真正核心。
 

@@ -45,7 +45,7 @@ y = x * 3             y₁ = x₂ * 3
 x = y + 1             x₃ = y₁ + 1
 ```
 
-在 SSA 中，如果控制流汇合（if-else 的合并点），需要引入 φ（phi）函数来选择正确的值版本。Inductor 的 IR 不使用经典的 φ 节点，而是通过 `MutableBox` 模式实现类似的效果。
+在 SSA 中，如果控制流汇合（if-else 的合并点），需要引入 φ（phi）函数来选择正确的值版本。Inductor 的 IR 不使用经典的 φ 节点——因为 Dynamo 已将控制流展平，不存在控制流汇合。`MutableBox` 的设计目的是支持 in-place 修改（如 `+=` 操作）和 view 的透明传递，而非传统 SSA 中 phi 节点的控制流汇合值选择功能。
 
 **基本块（Basic Block）：** 一个连续的指令序列，只有一个入口（第一条指令）和一个出口（最后一条指令）。基本块是控制流图（CFG）的节点。
 
@@ -217,6 +217,12 @@ classDiagram
         +unwrap_view()
     }
 
+    class GenericView {
+        +Sequence size
+        +Callable reindex
+        +create(x, new_size, reindex)
+    }
+
     class Buffer {
         +str name
         +OutputSpec layout
@@ -252,6 +258,26 @@ classDiagram
         +make_loader()
     }
 
+    class Operation {
+        +str operation_name
+        +get_read_writes()
+        +get_outputs()
+        +is_extern()
+    }
+
+    class OperationBuffer {
+        <<Buffer + Operation>>
+        +get_outputs()
+        +get_defining_op()
+    }
+
+    class ExternKernel {
+        +Sequence constant_args
+        +dict kwargs
+        +op_overload
+        +is_extern() True
+    }
+
     IRNode <|-- Loops
     IRNode <|-- BaseView
     IRNode <|-- Buffer
@@ -259,14 +285,18 @@ classDiagram
     Loops <|-- Pointwise
     Pointwise <|-- Scatter
     Loops <|-- Reduction
-    Buffer <|-- ComputedBuffer
     Buffer <|-- InputBuffer
     Buffer <|-- TemplateBuffer
+    Operation <|-- OperationBuffer
+    Buffer <|-- OperationBuffer
+    OperationBuffer <|-- ComputedBuffer
+    OperationBuffer <|-- ExternKernel
     MutableBox <|-- TensorBox
     MutableBox <|-- StorageBox
     BaseView <|-- ExpandView
     BaseView <|-- PermuteView
-    BaseView <|-- View
+    BaseView <|-- GenericView
+    GenericView <|-- View
     BaseView <|-- ReinterpretView
 ```
 
@@ -356,7 +386,7 @@ def make_loader(self):
 
 #### ComputedBuffer（ir.py line 4781）— 核心子类
 
-**设计决策：** `ComputedBuffer` 是 `Buffer` 和 `Operation` 的组合——它既是一个命名的内存分配，也是一个产生输出的计算操作。
+**设计决策：** 实际继承链是 `Buffer + Operation → OperationBuffer → ComputedBuffer`。`OperationBuffer` 通过多重继承同时具备 `Buffer`（内存分配）和 `Operation`（计算操作）的身份。`ComputedBuffer` 继承 `OperationBuffer`，既是一个命名的内存分配，也是一个产生输出的计算操作。`Operation` 基类（ir.py）定义了 `get_read_writes()`、`get_outputs()`、`is_extern()` 等接口，所有计算节点（无论是 Loops 融合还是外部库调用）都通过它统一管理。
 
 **decide_layout()（line 4968）：** 为输出缓冲区选择最优的内存布局（步幅顺序）。策略：
 1. 分析所有输入缓冲区的步幅模式
@@ -364,6 +394,23 @@ def make_loader(self):
 3. 将 `FlexibleLayout` 转换为 `FixedLayout`
 
 **make_loader() 的内联优化（line 4907）：** 如果一个 ComputedBuffer 从未被读取过（零次 prior reads），且没有 mutation，它的 `make_loader()` 会直接返回内部 Pointwise 的 `inner_fn`，而不是发出 `ops.load()`。这就是 **producer-consumer fusion** 在 IR 层面的实现。
+
+#### ExternKernel（ir.py）—— 外部库调用的 IR 表示
+
+**语义：** `ExternKernel` 代表无法被 Inductor 融合的外部库调用（如 cuBLAS 的 `aten::addmm`、cuDNN 的卷积等）。它绕过 Triton/C++ 代码生成，直接调用底层库。
+
+**类层次：** `ExternKernel` 继承自 `InputsKernel`，而 `InputsKernel` 继承自 `OperationBuffer`（即 `Buffer + Operation` 的多重继承）。因此 `ExternKernel` 既是内存分配（Buffer），也是计算操作（Operation）。
+
+**What：** 当一个算子无法分解为简单的逐元素或规约操作时（如矩阵乘法、卷积），Inductor 会创建 `ExternKernel` 节点作为 fallback。
+
+**How：** `ExternKernel` 在代码生成阶段直接生成对 ATen 或外部库的调用，而不是通过 Triton/C++ 循环生成。`is_extern()` 方法返回 `True`，scheduler 据此将其排除在融合决策之外。
+
+**Why：** 并非所有操作都适合编译为自定义 kernel——BLAS 库经过数十年优化，其性能通常优于生成的代码。`ExternKernel` 让 Inductor 可以"外包"这些操作，同时保持 IR 的一致性。
+
+**关键子类：**
+- `ExternKernelOut`：原地操作变体（输出复用输入缓冲区）
+- `ExternKernelAlloc`：需要分配新输出的变体
+- `FallbackKernel`：完全 fallback 到 eager ATen 实现的变体
 
 #### TensorBox / StorageBox（ir.py line 9261/9427）
 
@@ -469,22 +516,30 @@ stride = (s1 * 64, 64, 1)  # 用 sympy 表达式表示步幅
 
 ## 代码示例
 
-### 示例 1：IR 节点的包装层次
+### 示例 1：观察 IR 节点的创建
 
 ```python
-# 演示 TensorBox → StorageBox → Pointwise 的包装链（对应第 3 章）
-# 这是对 Inductor lowering 过程的概念性演示
+import torch
+import torch._logging
 
-# Lowering "x + 1" 的过程：
-# 1. x 是一个 InputBuffer，已被包装为 TensorBox(StorageBox(InputBuffer))
-# 2. "x + 1" 的 lowering 会：
-#    a. 调用 x.make_loader()，得到 inner_fn（对于 Pointwise，就是 inner_fn 本身）
-#    b. 创建新的 inner_fn：lambda index: ops.add(loader_x(index), ops.constant(1))
-#    c. 创建 Pointwise.create(inner_fn=new_fn, ...)
-#    d. Pointwise.create() 自动包装为 TensorBox(StorageBox(Pointwise))
+# 启用 IR 日志，观察 Inductor 创建了哪些 IR 节点
+torch._logging.set_logs(ir_debug=True)
 
-# 此时，还没有真正的缓冲区分配——一切都是惰性的
-# 只有在 realize() 时，才会创建 ComputedBuffer 并注册到 V.graph
+@torch.compile
+def example(x):
+    return x * 2 + 1
+
+x = torch.randn(10)
+result = example(x)
+
+# 日志输出中可以看到：
+# 1. placeholder("x") 创建了 TensorBox(StorageBox(InputBuffer))
+# 2. "x * 2" 创建了 Pointwise(inner_fn=lambda idx: mul(load("x", idx), 2))
+#    并自动包装为 TensorBox(StorageBox(Pointwise))
+# 3. "+ 1" 的 Pointwise 通过 make_loader() 获取上一步的 inner_fn，
+#    组合为新的 Pointwise（这就是 fusion 在 IR 层面的基础）
+# 4. output() 时触发 realize()，Pointwise 被包装为 ComputedBuffer
+print(f"result = {result}")
 ```
 
 ### 示例 2：realize 触发物化

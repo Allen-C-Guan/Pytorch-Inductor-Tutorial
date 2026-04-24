@@ -44,12 +44,12 @@
 - [第 7 章：融合策略与循环优化](ch07_fusion.md)
 - [第 8 章：指令选择与代码生成](ch08_codegen.md)
 - [第 9 章：内存管理与缓冲区分配](ch09_memory.md)
-- [第 10 章：指令调度](ch10_scheduling.md)
+- [第 10 章：指令调度](ch10_instruction_scheduling.md)
 
 ### 第五部分：集成与展望
 
-- [第 11 章：端到端编译流程回顾](ch11_e2e_pipeline.md)
-- [第 12 章：与 PyTorch 生态的协同设计](ch12_ecosystem.md)
+- [第 11 章：端到端编译流程回顾](ch11_e2e_compilation.md)
+- [第 12 章：与 PyTorch 生态的协同设计](ch12_pytorch_ecosystem.md)
 
 ### 附录
 

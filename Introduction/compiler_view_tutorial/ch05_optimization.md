@@ -53,28 +53,11 @@ t2 = a + b      -->        t2 = t1       (复用 t1)
 t3 = t1 * t2               t3 = t1 * t1  (t2 已被替换)
 ```
 
-**值编号算法（Value Numbering）：**
+**经典理论背景：GVN 与 Inductor 的实际 CSE 策略**
 
-GVN（Global Value Numbering）是 CSE 的经典实现策略。其核心思想是为每个表达式分配一个规范化的"编号"（即哈希值），相同编号的表达式保证计算相同结果。
+GVN（Global Value Numbering）是 CSE 的经典实现策略，其核心思想是为每个表达式分配一个规范化的"编号"（即哈希值），相同编号的表达式保证计算相同结果。
 
-算法伪代码：
-
-```
-Algorithm GVN:
-  Input:  Basic block or extended basic block
-  Output: Optimized code with CSE applied
-
-  VN = empty map  // value number table
-  for each instruction i in program order:
-    vn_args = [VN[arg] for arg in i.args]
-    hash_key = (i.opcode, vn_args)
-    if hash_key in VN:
-      replace i with VN[hash_key]  // CSE hit
-    else:
-      VN[hash_key] = i.result
-```
-
-**哈希函数设计：** 哈希函数 `H(op, args)` 需要满足：如果两个表达式的算子和参数的值编号都相同，则它们必定计算相同结果。这要求哈希函数对交换律算子（如加法、乘法）进行参数排序规范化。
+> **注意：Inductor 的 kernel CSE 并非经典值编号（GVN），而是基于表达式字符串的公共子表达式消除（CSE）**——以 IR 表达式的字符串表示为哈希键，检测重复计算。GVN 的理论背景有助于理解 CSE 的本质，但 Inductor 的实现更简单直接。
 
 **为什么需要 CSE：** 在深度学习编译器中，同一子图可能在多处被展开。例如，softmax 中的 `x - x.amax(dim)` 和 `x.exp()` 都需要 `x` 的 amax 值，如果存在冗余计算，CSE 可以消除。更重要的是，在 Inductor 的 kernel 代码生成阶段，多个 loop iteration 可能在不同 index 下加载相同地址，CSE 能将其合并为单次加载。
 
@@ -84,53 +67,11 @@ Algorithm GVN:
 
 **死代码的严格定义：**
 
-一条指令 `i` 是**死代码**（dead code），当且仅当 `i` 的结果在程序的任何执行路径上都不被使用（或者仅被其他死代码使用）。形式化地，定义 `Def(i)` 为指令 `i` 定值的变量集合，`Use(v)` 为使用变量 `v` 的指令集合。变量 `v` 是死变量当且仅当 `Use(v) ⊆ DeadInstructions`。
+一条指令 `i` 是**死代码**（dead code），当且仅当 `i` 的结果在程序的任何执行路径上都不被使用（或者仅被其他死代码使用）。形式化地，定义 `Def(i)` 为指令 `i` 定值的变量集合，`Use(v)` 为使用变量 `v` 的指令集合。变量 `v` 是死变量，当且仅当，`Use(v) ⊆ DeadInstructions`。
 
 **活跃变量分析（Live Variable Analysis）作为前置：**
 
-DCE 的前提是确定哪些变量是"活跃的"（live）。活跃变量分析是一种**逆向数据流分析**（backward data-flow analysis）：
-
-- **转移函数（Transfer Function）：** `OUT[n] = (IN[n] - DEF[n]) ∪ USE[n]`
-  其中 `DEF[n]` 是基本块 `n` 中定值的变量集，`USE[n]` 是 `n` 中在定值前就使用的变量集
-- **交汇算子（Meet Operator）：** `IN[n] = ∪_{s ∈ succ(n)} OUT[s]`（并集）
-- **初始值：** 所有 `OUT[exit] = ∅`
-
-**迭代数据流分析框架：**
-
-数据流分析的核心框架包含以下要素：
-1. **半格（Semilattice）**：定义值域和偏序关系
-2. **转移函数族**：每个程序点关联一个转移函数
-3. **初始值**：格的 TOP 或 BOTTOM 元素
-
-框架要求转移函数**单调（monotone）**——即输入增大时输出不会减小。单调性保证算法必然收敛到不动点。
-
-**Worklist Algorithm 的完整伪代码：**
-
-```
-Algorithm WorklistIterativeAnalysis:
-  Input:  Control flow graph G = (N, E), transfer functions F, initial values
-  Output: Fixed-point solution IN[n], OUT[n] for all n in N
-
-  // 初始化
-  for each node n in N:
-    IN[n] = TOP        // 或 BOTTOM，取决于分析方向
-    OUT[n] = F[n](IN[n])
-  Worklist = N          // 所有节点入队
-
-  // 迭代
-  while Worklist is not empty:
-    n = Worklist.pop()
-    old_OUT = OUT[n]
-    IN[n] = Meet({OUT[s] : s in pred(n)})  // 前驱/后继取决于分析方向
-    OUT[n] = F[n](IN[n])
-    if OUT[n] != old_OUT:
-      for each successor s of n:
-        Worklist.add(s)    // 将受影响的节点重新入队
-
-  return IN, OUT
-```
-
-**复杂度分析：** 设格高度为 `h`（即最长链的长度），CFG 节点数为 `n`，每个节点最多传播 `h` 次更新，每次更新最多触发 `O(n)` 个后继节点，因此总复杂度为 `O(n * h)`。对于位向量实现的活跃变量分析，`h = 2`（每个变量只能从不活跃变为活跃），因此总复杂度为 `O(n * |V|)`，其中 `|V|` 是变量数。
+DCE 的前提是确定哪些变量是"活跃的"（live）。活跃变量分析是一种**逆向数据流分析**（backward data-flow analysis），其转移函数为 `OUT[n] = (IN[n] - DEF[n]) ∪ USE[n]`，交汇算子为并集。经典实现使用 Worklist Algorithm：初始化所有程序点的格值为 TOP/BOTTOM，迭代应用转移函数直到不动点。格的单调性保证算法必然收敛。
 
 **为什么需要 DCE：** 在 Inductor 编译过程中，Lowering 分解、pattern 替换等操作经常产生中间节点。例如，`remove_noop_ops` 将 no-op 操作替换后可能遗留未使用的计算。Inductor 在 `post_grad_passes` 中调用 `gm.graph.eliminate_dead_code()` 来清理这些无用节点。
 
@@ -138,45 +79,11 @@ Algorithm WorklistIterativeAnalysis:
 
 #### 常量折叠与常量传播
 
-**格论（Lattice Theory）基础：**
+**理论基础：格论与常量传播**
 
-常量传播的理论基础是**偏序格（Partially Ordered Lattice）**。一个格是一个二元组 `(L, ⊑)`，其中 `L` 是元素集合，`⊑` 是偏序关系，满足对于任意 `a, b ∈ L`，都存在**最小上界（join, ⊔）**和**最大下界（meet, ⊓）**。
+常量传播的经典理论基于**半格（Semilattice）**：值域为 `TOP`（未知） > `Constant(val)`（已知常量） > `BOTTOM`（非常量），形成偏序关系。转移函数按拓扑序传播格值——若输入均为 `Constant`，则在编译时计算结果；若任一输入为 `BOTTOM`，则输出也为 `BOTTOM`。格的高度为 3，保证迭代数据流分析在有限步内收敛。φ 节点处取两个前驱的 meet（最大下界）：相同常量取自身，不同常量降为 `BOTTOM`。
 
-在常量传播中，我们使用一个**半格（Semilattice）**，其值域为：
-
-```
-      TOP (未初始化/未知)
-     / | \
-    c1  c2  c3 ...  (已知常量值)
-     \ | /
-      BOTTOM (非常量/冲突)
-```
-
-偏序关系定义为：`TOP ⊑ c` 对所有常量 `c` 成立；`c ⊑ BOTTOM` 对所有常量 `c` 成立。
-
-**常量传播的格定义和转移函数：**
-
-对于每个变量 `v`，格值为 `LatticeVal ∈ {TOP, Constant(val), BOTTOM}`。
-
-转移函数定义（以二元算术运算 `v = a op b` 为例）：
-
-```
-TransferFunction(v = a op b):
-  if lattice[a] is TOP or lattice[b] is TOP:
-    lattice[v] = TOP
-  else if lattice[a] is Constant(c1) and lattice[b] is Constant(c2):
-    lattice[v] = Constant(eval(op, c1, c2))  // 编译时计算
-  else:
-    lattice[v] = BOTTOM  // 非常量
-```
-
-对于 φ 节点（汇合点）：`lattice[v] = lattice[v] ⊓ lattice[v']`，即取两个前驱的 meet（最大下界）。具体规则：`TOP ⊓ c = c`，`c ⊓ c = c`，`c1 ⊓ c2 = BOTTOM (c1 ≠ c2)`。
-
-**不动点迭代收敛性证明思路：**
-
-单调性定理：常量传播的转移函数 `f` 是单调的，即 `x ⊑ y ⟹ f(x) ⊑ f(y)`。
-
-证明思路：考虑转移函数的每种情况，输入格值从 TOP 到 BOTTOM 单调递减时，输出也单调递减。格的高度是 3（TOP -> Constant -> BOTTOM），因此每个变量最多下降 2 次。总迭代次数不超过 `O(n * |V|)`，其中 `n` 是 CFG 节点数，`|V|` 是变量数。
+> **注意：Inductor 的常量折叠使用 `torch.fx.Interpreter` 单遍执行模式**——按拓扑序逐节点求值，无需迭代数据流分析。上述格论理论作为理解常量传播原理的基础。
 
 **为什么需要常量折叠：** 在深度学习模型中，大量参数（如 BatchNorm 的 running mean/var、量化参数）在推理时是固定常量。常量折叠可以在编译时预计算这些值，避免运行时重复计算。
 
@@ -216,22 +123,15 @@ TransferFunction(v = a op b):
 
 #### 迭代数据流分析的收敛性
 
-数据流分析的正确性依赖于两个关键性质：
+迭代数据流分析的正确性依赖于转移函数的**单调性**和格高度的**有界性**，保证算法收敛到最大不动点（MFP）。格高度决定了最坏情况迭代次数：对于位向量实现的活跃变量分析，格高度为 2，总迭代次数最多 `|V| * |N|` 次。
 
-1. **单调性（Monotonicity）**：转移函数 `f` 满足 `x ⊑ y ⟹ f(x) ⊑ f(y)`
-2. **格的高度有界性**：格中不存在无限长的严格递增/递减链
-
-收敛性定理：在单调框架中，迭代数据流分析必然收敛到**最大不动点（Maximal Fixed Point, MFP）**，且 MFP 是解的上界中最精确的（即最小上界）。
-
-格的高度决定了最坏情况下的迭代次数。对于位向量实现的活跃变量分析，格高度为 2（每个 bit 只能从 0 变为 1），总迭代次数最多 `|V| * |N|` 次。
+> **注意：Inductor 的常量折叠使用 Interpreter 单遍执行模式，而非传统的迭代数据流分析。** 上述理论作为理解常量传播原理的基础。
 
 #### Pattern Matching 算法
 
 Inductor 的 pattern matching 采用**子图同构**的方法。其核心问题是：给定一个 pattern DAG `P` 和一个目标图 `G`，找出 `G` 中所有与 `P` 同构的子图。
 
 **树模式匹配（Tree Pattern Matching）：** 当 pattern 是一棵树（无共享节点）时，匹配算法较为简单。对目标图中的每个候选节点，自顶向下或自底向上尝试匹配 pattern 的每个节点。
-
-**DFA 在 pattern matching 中的应用：** 理论上，线性模式的集合可以被编译为一个确定性有限自动机（DFA），使得匹配过程只需对输入进行一次扫描。然而，Inductor 的 pattern 是 DAG 形式（允许多输出和共享子 pattern），因此不能直接使用 DFA，而是采用**基于解释器的回溯匹配**：对每个候选锚点节点，递归匹配 pattern 的子表达式。
 
 **Inductor 的匹配策略：** 源码中 `PatternMatcherPass.apply()` 方法按目标函数（target）组织 pattern。对图中的每个节点，查找以其 target 为键的 pattern 列表，然后逐一尝试匹配。匹配顺序是**逆拓扑序**（`reverse=True` 排序），这样后面的 pattern 可以利用前面匹配的中间结果。
 
@@ -287,10 +187,10 @@ Inductor 选择多层级优化的原因：
 
 | 方面 | LLVM Pass Manager | Inductor Pattern Matcher |
 |------|-------------------|--------------------------|
-| Pass 注册 | 静态注册，pass 间有依赖声明 | 动态注册，pattern 按目标函数分组 |
-| 执行顺序 | 基于依赖拓扑排序 | 按阶段（pre-grad -> joint -> post-grad）固定顺序 |
 | 分析结果传递 | AnalysisManager 缓存和复用 | 通过 node.meta 字典传递 |
 | 迭代控制 | 可配置迭代次数 | 每个 pattern 最多匹配一次（单 pass） |
+
+LLVM 的 pass 间依赖声明和拓扑排序执行 vs Inductor 按阶段（pre-grad -> joint -> post-grad）固定顺序执行，反映了传统编译器与 ML 编译器在优化管线设计上的根本差异：前者追求全局最优的 pass 编排，后者追求编译速度和确定性。
 
 ### Pattern Matcher 框架的设计哲学
 
@@ -299,6 +199,17 @@ Inductor 的 Pattern Matcher 框架体现了以下设计哲学：
 1. **声明式 Pattern 定义**：开发者只需描述"匹配什么"（search pattern）和"替换为什么"（replace pattern），框架负责匹配逻辑。这大大降低了编写优化的门槛。
 2. **惰性初始化（Lazy Init）**：pattern 通过 `@init_once_fakemode` 装饰器延迟注册，避免启动时开销。
 3. **可扩展性**：通过 `config.pre_grad_custom_pass`、`config.post_grad_custom_pre_pass` 等配置项，用户可以注入自定义 pass。
+
+### IR 级 Pattern 匹配：`register_lowering_pattern`
+
+除了 FX Graph 层的 pattern 匹配（`register_graph_pattern`），Inductor 还提供 `register_lowering_pattern`（`pattern_matcher.py` 第 1918 行）用于 **Lowering 阶段的 IR 级替换**。它匹配 ATen 子图，但替换目标不是 FX 节点，而是直接构造 Inductor IR 对象。
+
+工作流程：
+1. 在 Lowering 时，`LoweringPatternEntry` 对每个候选 FX 节点调用匹配
+2. 匹配成功后，调用注册的 handler 函数，handler 直接返回 `ir.Pointwise`、`ir.Reduction` 等 IR 构造
+3. 这些 IR 构造绕过了标准的 ATen -> IR 逐算子 Lowering 路径，实现语义等价但更优化的 IR 序列
+
+典型应用：`mm_plus_mm`（将两个矩阵乘加融合为单次调用）、`batch_norm`（将 BN 分解为优化的 IR 序列）。与 FX Graph 层 pattern 的关键区别是：IR 级 pattern 的 handler 返回的是 Inductor IR 对象而非 FX 子图，因此可以更精细地控制 Lowering 后的循环结构和内存访问模式。
 
 ---
 
@@ -663,25 +574,7 @@ flowchart TD
 
 ---
 
-## 8. 数据流分析的迭代过程
-
-```mermaid
-flowchart TD
-    A[初始化: 所有节点 IN/OUT = TOP] --> B[Worklist = 所有节点]
-    B --> C{Worklist 为空?}
-    C -->|是| D[收敛: 返回 IN/OUT]
-    C -->|否| E[取出节点 n]
-    E --> F[计算 IN_n = Meet OUT_succ]
-    F --> G[计算 OUT_n = F_n IN_n]
-    G --> H{OUT_n 变化?}
-    H -->|否| C
-    H -->|是| I[将 n 的后继加入 Worklist]
-    I --> C
-```
-
----
-
-## 9. 代码示例
+## 8. 代码示例
 
 ### 示例 1：观察 CSE 效果
 
