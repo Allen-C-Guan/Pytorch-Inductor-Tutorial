@@ -30,8 +30,9 @@ graph LR
 
 ### 前置知识
 
-- **第三章**（IR 与 Lowering）：理解 `ir.ComputedBuffer`、`ir.TemplateBuffer`、`ir.ExternKernel` 的结构
-- **第四章**（Virtualized 系统）：对 `V.ops`、`V.graph` 有基本了解
+- **第三章**（IR 设计）：理解 `ir.ComputedBuffer`、`ir.TemplateBuffer`、`ir.ExternKernel` 的结构
+- **第四章**（Lowering）：理解 Lowering 的基本流程和 `V.graph` 全局上下文（第一章 4.3.1 节介绍了 `V.graph` 的概念）
+- **本章 3.1 节**：Handler Swapping 模式（`V.ops` 的动态分发机制）将在本章内部详细讲解
 - **离散数学**：有向图、拓扑排序、传递闭包
 - **Python 数据类**：`dataclass`、`frozen=True` 的语义
 
