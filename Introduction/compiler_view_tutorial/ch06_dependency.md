@@ -653,7 +653,7 @@ class MemoryDep(Dep):
 
 **关键方法：`decide_loop_order_to_match()`**
 
-这个方法是 Inductor 依赖分析的精华之一。给定两个 MemoryDep（分别来自待融合的两个节点），它判断是否可以通过重排循环顺序使两者兼容：
+这个方法是 Inductor 依赖分析的精华之一。给定两个 MemoryDep（分别来自待融合的两个节点），它判断是否可以通过重排循环顺序使两者兼容：  //TODO:待修复
 
 ```python
 def decide_loop_order_to_match(self, other: "MemoryDep") -> list[int] | None:
