@@ -674,8 +674,8 @@ def decide_loop_order_to_match(self, other: "MemoryDep") -> list[int] | None:
 
 例如：
 - 节点 A 读取 `buf[d0*512 + d1]`，stride = (512, 1)
-- 节点 B 读取 `buf[d1*128 + d0]`，stride = (1, 128)
-- 不匹配！但如果 A 重排循环为 `[d1, d0]`，则 A 的 stride 变为 (1, 128)，匹配 B
+- 节点 B 读取 `buf[d1*512 + d0]`，stride = (1, 512)
+- 不匹配！但如果 A 重排循环为 `[d1, d0]`，则 A 的 stride 变为 (1, 512)，匹配 B（这里的匹配指的是，只要stride set一致即可，无非就是访问顺序不一致而已）
 
 **bail-out 条件**（line 111-147）：
 - 广播维度（`num_vars != len(free_symbols)`）
