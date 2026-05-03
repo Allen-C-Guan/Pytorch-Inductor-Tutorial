@@ -1155,3 +1155,7 @@ DAG 中的边代表一个节点对另一个节点的依赖，主要通过 `Dep` 
 *   **边**: 消费者节点内部的 `MemoryDep(name='buf_mul', ...)` 对象精准描述了这条数据依赖。
 
 这种设计将计算操作（Node）、数据依赖（Dep）和连接关系（Buffer的users列表）清晰地分离，其优点是**灵活性高，便于进行复杂的依赖分析和图优化**，但也如你所感，其缺点是**数据结构嵌套较多，导致关系不够直观**。
+<img width="930" height="670" alt="image" src="https://github.com/user-attachments/assets/4c36a705-09e2-4ff0-98cd-e8fb37f654b2" />
+
+
+
