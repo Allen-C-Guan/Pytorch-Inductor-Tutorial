@@ -1057,3 +1057,136 @@ Node(name=Node_C_mul, ancestors={'Node_B_add'}, last_usage={'buf_b'})
 你现在已经完全掌握了计算图中单点的数据流约束（`reads`/`writes`）以及多节点之间的拓扑网（`users`/`unmet_deps`）。
 
 在深度学习编译器中，除了保证正确执行顺序外，最大的性能优化手段就是**算子融合（Operator Fusion）**（即把两个节点合成一个 C++ Kernel，省去写回显存的开销）。基于我们对 `users` 和 `unmet_dependencies` 的理解，你认为调度器在判断 **“节点 A 和节点 B 能不能融合在一起”** 时，这张全局依赖网（特别是多出来的 Fake Deps）会起到怎样的限制或指导作用？
+
+
+
+## scheduler DAG
+在 PyTorch Inductor 的 Scheduler 中，所谓的 DAG 并不是一个用显式指针（如 `next`, `prev`）相连的图结构，而是一个逻辑上的数据依赖网络。它的核心是基于 **Buffer（缓冲区）** 这一概念建立的“生产者-消费者”关系。
+
+简单来说，**Node（节点）** 代表计算操作，**Edge（边）** 代表数据依赖，而具体的连接关系则通过专门的数据结构来维护。
+
+### 核心数据结构一览
+
+为了方便理解，我将这些结构分为“节点”、“边”和“连接关系”三类来介绍。
+
+#### ⚙️ 1. 节点（Node）
+
+DAG 中的节点是对 IR（中间表示）操作的封装，其基类是 `BaseSchedulerNode`。
+
+*   **`BaseSchedulerNode`**: 调度器节点的抽象基类。它包含了节点共有的属性和方法，比如依赖管理。
+    *   **关键属性**:
+        *   `node`: 指向其封装的底层 IR 操作 (如 `ComputedBuffer`)。
+        *   `read_writes`: 一个 `ReadWrites` 对象，记录了本节点的所有依赖关系。
+        *   `unmet_dependencies`: 一个 `OrderedSet[Dep]`，记录当前节点**尚未满足**的依赖。当此集合为空时，表示节点已就绪，可被调度执行。
+        *   `outputs`: 一个 `SchedulerBuffer` 列表，代表此节点产生的输出。
+        *   `ancestors`: 一个 `OrderedSet[str]`，存储在融合操作中，此节点的祖先节点的名称。
+
+*   **`SchedulerNode`**: 这是最常见的节点类型，继承自 `BaseSchedulerNode`。它封装了像 `ComputedBuffer` 这样的单一计算操作。你在示例中看到的 `ComputedBuffer` 就是一种 IR 操作，它被 `SchedulerNode` 包裹。
+
+*   **`FusedSchedulerNode`**: 当一个或多个 `SchedulerNode` 被融合（Fuse）成一个更大的内核时，就会产生此节点。它代表一个由多个操作组成的融合内核。
+
+*   **`ExternKernelSchedulerNode`**: 代表对外部库（如 cuBLAS, CUTLASS）调用的节点。
+
+#### ➡️ 2. 边（Edge）
+
+DAG 中的边代表一个节点对另一个节点的依赖，主要通过 `Dep` 类系列表示。
+
+*   **`Dep`**: 所有依赖类型的抽象基类，代表一个依赖项的通用接口。
+
+*   **`MemoryDep`**: 最常见的数据依赖。它精确描述了一次内存访问，即“我需要读取由某个 `name` 标识的缓冲区中的数据”。这构成了DAG中绝大多数的边。
+
+*   **`StarDep`**: 一种“通配符”依赖。通常用作屏障，表示“我依赖于在某个操作点之前完成的所有写操作”。
+
+*   **`WeakDep`**: 一种弱依赖，主要用于性能优化（如数据预取）而非逻辑正确性。它暗示了理想的执行顺序，但不强制执行。
+
+#### 🔗 3. 连接关系（Connection）
+
+节点和边是如何关联起来的？
+
+*   **`ReadWrites`**: 节点通过 `read_writes` 属性来声明自己的依赖。该属性是一个 `ReadWrites` 对象（以 `@dataclass` 形式存在），它包含两个核心集合：记录所有读取依赖的 `reads` 和所有写入依赖的 `writes`。
+
+*   **`SchedulerBuffer`**: 缓冲区是连接的关键。一个节点通过 `writes` 声明其产出（即 `SchedulerBuffer`）。该缓冲区对象维护了一个 `users` 列表，记录所有需要读取它的下游节点。
+
+*   **`NodeUser`**: `users` 列表中的元素，专门用于描述一个节点如何使用某个缓冲区。它记录了节点 (`node`) 和用于读取的依赖对象 (`Dep`)，以及是否可以进行原地操作 (`can_inplace`) 等信息。
+
+*   **`outputs`**: `BaseSchedulerNode` 的 `outputs` 属性是该节点产出的 `SchedulerBuffer` 列表。这个属性直接关联了生产者和消费者，是构建数据流图的关键。
+
+#### 💎 总结：从 DAG 视角看数据结构
+
+| DAG 要素 | 具体数据结构 | 作用说明 |
+| :--- | :--- | :--- |
+| **节点 (Node)** | `BaseSchedulerNode` 及其子类（`SchedulerNode`, `FusedSchedulerNode` 等） | 代表一个或一组计算操作。 |
+| **边 (Edge)** | `Dep` 及其子类（`MemoryDep`, `StarDep`, `WeakDep`） 的实例 | 代表一种依赖关系。具体边由 `MemoryDep` 对象表示。 |
+| **入边 (In Edge)** | 存储在节点的 `unmet_dependencies` 集合中 | 记录了一个节点执行前必须满足的所有依赖。 |
+| **出边 (Out Edge)** | 通过 `SchedulerBuffer` 上的 `users` 列表间接体现 | 一个节点的输出如何被下游消费者使用。 |
+| **连接枢纽** | `SchedulerBuffer` 和其上的 `users` 列表 | 物理上将生产者 (`writes`) 和消费者 (`reads`) 连接起来。 |
+
+### 图解与实例
+
+为了更直观地理解，我们以一个简单的表达式 `out = add(mul(x, w), b)` 为例。简化后的计算图包含 `mul` 和 `add` 两个操作。
+
+#### 1. DAG 结构图示
+
+下图展示了对应的 DAG 结构，并标注了上述数据结构：
+
+```mermaid
+graph TD
+    subgraph “缓冲区 (Buffers)”
+        Buf_x(“buf_x (InputBuffer)”)
+        Buf_w(“buf_w (InputBuffer)”)
+        Buf_b(“buf_b (InputBuffer)”)
+        Buf_mul(“buf_mul (ComputedBuffer)”)
+        Buf_out(“buf_out (OutputBuffer)”)
+    end
+
+    subgraph “节点 2: SchedulerNode (Add)”
+        NodeAdd[“SchedulerNode (add)”]
+        NodeAdd_rw[“read_writes (ReadWrites)”]
+        NodeAdd_unmet[“unmet_dependencies”]
+    end
+
+    subgraph “节点 1: SchedulerNode (Mul)”
+        NodeMul[“SchedulerNode (mul)”]
+        NodeMul_rw[“read_writes (ReadWrites)”]
+        NodeMul_unmet[“unmet_dependencies”]
+    end
+
+    Buf_x -- “MemoryDep (name=‘buf_x’)” ---> NodeMul_rw
+    Buf_w -- “MemoryDep (name=‘buf_w’)” ---> NodeMul_rw
+    Buf_b -- “MemoryDep (name=‘buf_b’)” ---> NodeAdd_rw
+    Buf_mul -- “MemoryDep (name=‘buf_mul’) ” ---> NodeAdd_rw
+
+    NodeMul_rw -- “writes: MemoryDep(name=‘buf_mul’)” --> Buf_mul
+    NodeAdd_rw -- “writes: MemoryDep(name=‘buf_out’)” --> Buf_out
+
+    NodeMul -- “outputs” --> Buf_mul
+    NodeAdd -- “outputs” --> Buf_out
+    Buf_mul -- “users: [NodeUser(node=NodeAdd, ...)]” --> NodeAdd
+
+    NodeAdd_rw -.-> NodeAdd_unmet
+    NodeMul_rw -.-> NodeMul_unmet
+```
+
+#### 2. 实例说明
+
+我们基于上述 `out = add(mul(x, w), b)` 的例子，逐步拆解数据结构是如何填充的：
+
+1.  **构建阶段**:
+    编译器为 `mul(x, w)` 创建一个 `ComputedBuffer`（名字为 `buf_mul`），为 `add(...)` 创建另一个 `ComputedBuffer`（名字为 `buf_out`），并为输入 `x`, `w`, `b` 创建 `InputBuffer`。随后，调度器为每个非输入 `Buffer` 创建一个 `SchedulerNode` 进行封装。
+
+2.  **依赖分析 (`compute_dependencies`)**:
+    调度器遍历所有节点，分析每个 `ComputedBuffer` 的 `data` 属性，提取出它需要读取哪些缓冲区。
+    *   对于 `SchedulerNode (Add)`，它发现需要读取 `buf_mul` 和 `buf_b`。
+    *   调度器为这两个读操作分别创建 `MemoryDep(name='buf_mul', ...)` 和 `MemoryDep(name='buf_b', ...)` 对象，并填充到该节点 `read_writes` 的 `reads` 集合和 `unmet_dependencies` 集合中。
+
+3.  **构建连接**:
+    *   `SchedulerNode (Mul)` 产生输出 `buf_mul`，因此它的 `read_writes.writes` 包含 `MemoryDep(name='buf_mul', ...)`。同时，它的 `outputs` 属性会创建一个 `SchedulerBuffer(buf_mul)` 对象。
+    *   `SchedulerNode (Add)` 需要读取 `buf_mul`。调度器会在 `SchedulerBuffer(buf_mul)` 的 `users` 列表中追加一个 `NodeUser(node=SchedulerNode(Add), ...)` 对象。
+
+通过这种方式，`SchedulerNode (Mul)` 和 `SchedulerNode (Add)` 之间就通过 `SchedulerBuffer(buf_mul)` 建立了“生产者-消费者”关系。
+
+*   **生产者**: `SchedulerNode (Mul)` 通过 `outputs` 属性持有 `SchedulerBuffer(buf_mul)` 对象。
+*   **消费者**: `SchedulerBuffer(buf_mul)` 对象的 `users` 列表中包含了指向 `SchedulerNode (Add)` 的 `NodeUser`。
+*   **边**: 消费者节点内部的 `MemoryDep(name='buf_mul', ...)` 对象精准描述了这条数据依赖。
+
+这种设计将计算操作（Node）、数据依赖（Dep）和连接关系（Buffer的users列表）清晰地分离，其优点是**灵活性高，便于进行复杂的依赖分析和图优化**，但也如你所感，其缺点是**数据结构嵌套较多，导致关系不够直观**。
