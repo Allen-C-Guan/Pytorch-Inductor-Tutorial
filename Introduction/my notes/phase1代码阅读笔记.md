@@ -1128,8 +1128,7 @@ DAG 中的边代表一个节点对另一个节点的依赖，主要通过 `Dep` 
 #### 1. DAG 结构图示
 
 下图展示了对应的 DAG 结构，并标注了上述数据结构：
-<img width="3448" height="3039" alt="deepseek_mermaid_20260503_7192e7" src="https://github.com/user-attachments/assets/2c5cf41b-8229-469b-8338-6ed3515dc561" />
-
+<img width="5847" height="2412" alt="deepseek_mermaid_20260503_c17991" src="https://github.com/user-attachments/assets/faf94521-133b-409d-b725-2f3fb424c44f" />
 
 
 #### 2. 实例说明
