@@ -1128,58 +1128,9 @@ DAG 中的边代表一个节点对另一个节点的依赖，主要通过 `Dep` 
 #### 1. DAG 结构图示
 
 下图展示了对应的 DAG 结构，并标注了上述数据结构：
+<img width="3448" height="3039" alt="deepseek_mermaid_20260503_7192e7" src="https://github.com/user-attachments/assets/2c5cf41b-8229-469b-8338-6ed3515dc561" />
 
-flowchart TD
-    %% 定义节点样式
-    classDef buffer fill:#e1f5fe,stroke:#01579b;
-    classDef readwrite fill:#fff9c4,stroke:#fbc02d;
-    classDef unmet fill:#fce4ec,stroke:#c2185b;
-    classDef node fill:#e8f5e9,stroke:#2e7d32;
-    classDef edgeLabel font-size:10px;
 
-    subgraph Buffers [“SchedulerBuffer 实例”]
-        direction LR
-        buf_x["buf_x (InputBuffer)"]:::buffer
-        buf_w["buf_w (InputBuffer)"]:::buffer
-        buf_b["buf_b (InputBuffer)"]:::buffer
-        buf_mul["buf_mul (ComputedBuffer)"]:::buffer
-        buf_out["buf_out (OutputBuffer)"]:::buffer
-    end
-    
-    subgraph Node_Mul [“SchedulerNode (Mul)”]
-        node_mul["SchedulerNode (Mul)"]:::node
-        n_mul_rw["read_writes (ReadWrites)"]:::readwrite
-        n_mul_unmet["unmet_dependencies (OrderedSet[Dep])"]:::unmet
-    end
-    
-    subgraph Node_Add [“SchedulerNode (Add)”]
-        node_add["SchedulerNode (Add)"]:::node
-        n_add_rw["read_writes (ReadWrites)"]:::readwrite
-        n_add_unmet["unmet_dependencies (OrderedSet[Dep])"]:::unmet
-    end
-    
-    %% 读取依赖 (In Edges 体现为 unmet_dependencies 中的 MemoryDep)
-    buf_x -- "MemoryDep(name='buf_x')" --> n_mul_rw:::edgeLabel
-    buf_w -- "MemoryDep(name='buf_w')" --> n_mul_rw:::edgeLabel
-    buf_b -- "MemoryDep(name='buf_b')" --> n_add_rw:::edgeLabel
-    buf_mul -- "MemoryDep(name='buf_mul')" --> n_add_rw:::edgeLabel
-    
-    %% 写入声明 (SchedulerBuffer 通过 writes 建立)
-    n_mul_rw -- "writes: MemoryDep(name='buf_mul')" --> buf_mul:::edgeLabel
-    n_add_rw -- "writes: MemoryDep(name='buf_out')" --> buf_out:::edgeLabel
-    
-    %% output 属性：节点产出 SchedulerBuffer
-    node_mul -- "outputs: [SchedulerBuffer(buf_mul)]" --> buf_mul:::edgeLabel
-    node_add -- "outputs: [SchedulerBuffer(buf_out)]" --> buf_out:::edgeLabel
-    
-    %% Out Edges 的体现：SchedulerBuffer 的 users 列表
-    buf_mul -- "users: [NodeUser(node=Node_Add, can_inplace=False)]" --> node_add:::edgeLabel
-    
-    %% 节点内部关系
-    n_mul_rw -. "组成" .-> node_mul
-    n_mul_unmet -. "依赖信息" .-> n_mul_rw
-    n_add_rw -. "组成" .-> node_add
-    n_add_unmet -. "依赖信息" .-> n_add_rw
 
 #### 2. 实例说明
 
