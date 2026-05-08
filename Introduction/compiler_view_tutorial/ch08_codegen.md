@@ -419,7 +419,7 @@ TritonKernel 的代码生成内嵌了 autotuning 基础设施。`codegen_kernel(
 3. **配置候选生成**：在 `triton_heuristics` 模块中，`heuristics_for_device()` 根据设备类型和 kernel 类型（pointwise / reduction / mm）生成候选配置列表。每个 `triton.Config` 指定 `XBLOCK`、`num_warps`、`num_stages` 等参数的组合。
 
 4. **缓存机制**：autotune 结果通过 `autotune_local_cache`（默认开启）缓存到本地文件，后续相同 shape 的 kernel 直接复用。`autotune_remote_cache` 支持跨机器共享缓存。当缓存命中时，跳过 benchmark 阶段，编译时间从秒级降到毫秒级。
-```
+
 
 ### 8.4.4 TritonTemplateKernel：模板 Kernel 的代码生成
 
