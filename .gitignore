@@ -1,2 +1,3 @@
+.DS_Store
 code/trace
 code/src/torch_compile_debug
