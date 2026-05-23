@@ -4,6 +4,12 @@
 
 ## 内容导航
 
+### [High level Introduction of triton/](High%20level%20Introduction%20of%20triton/)——高层导论
+
+以工程实践视角对 Triton 编译器进行全景介绍，覆盖 kernel 全生命周期（编译→运行）、编译器架构全景与多后端适配、Dialect 与 Pass Pipeline 设计，共 **3 章 + 1 附录**。
+
+**适合**：刚接触 Triton，希望快速建立对 Triton 编译器"是什么、怎么运作"的整体认知。
+
 ### [triton_compiler_view_tutorial/](triton_compiler_view_tutorial/)——编译器设计视角
 
 以 *Engineering a Compiler* + *MLIR Tutorial* + *Programming Massively Parallel Processors* 三本教材为理论骨架，将 Triton 编译器的各个模块映射到编译器的经典阶段（前端 → 中间层 → 后端 → 运行时），从编译器理论的宏观视角理解 Triton 的全栈架构设计，共 **15 章 + 5 附录**。
@@ -23,26 +29,30 @@
 ## 推荐阅读顺序
 
 ```
-首次学习路线（编译器初学者）：
+首次学习路线：
 
-triton_compiler_view_tutorial   第 1 章      建立 Triton 全景认知
-        │                      编译器设计导论与 Triton 全景
+High level Introduction of triton  第 1-3 章   快速建立 Triton 整体认知
+        │                          kernel 全流程 → 编译器架构 → Dialect/Pipeline
         │
         v
-triton_compiler_view_tutorial   第 2-3 章    理解 Triton 编程模型和 TTIR
-        │                      DSL 设计 / MLIR 与 TTIR
+triton_compiler_view_tutorial      第 1 章      从编译器理论视角理解 Triton 全景
+        │                         编译器设计导论与 Triton 全景
         │
         v
-triton_compiler_view_tutorial   第 4-6 章    深入两级 IR 核心设计
-        │                      TTGIR / 类型系统 / Lowering
+triton_compiler_view_tutorial      第 2-3 章    理解 Triton 编程模型和 TTIR
+        │                         DSL 设计 / MLIR 与 TTIR
         │
         v
-triton_compiler_view_tutorial   第 7-12 章   掌握优化与代码生成
-        │                      循环/内存优化 → 指令选择 → 流水线 → 寄存器分配 → PTX 发射
+triton_compiler_view_tutorial      第 4-6 章    深入两级 IR 核心设计
+        │                         TTGIR / 类型系统 / Lowering
         │
         v
-triton_compiler_view_tutorial   第 13-15 章  理解运行时系统
-                              JIT/缓存 → Autotuning → 端到端回顾
+triton_compiler_view_tutorial      第 7-12 章   掌握优化与代码生成
+        │                         循环/内存优化 → 指令选择 → 流水线 → 寄存器分配 → PTX 发射
+        │
+        v
+triton_compiler_view_tutorial      第 13-15 章  理解运行时系统
+                                 JIT/缓存 → Autotuning → 端到端回顾
 ```
 
 > 也可以根据当前需要直接跳转到对应章节——每章是自包含的，但会标注前置依赖。

@@ -35,6 +35,7 @@ my pytorch tutorial/
 │
 ├── Triton Introduction/                 # Triton 编译器教程
 │   ├── README.md                        # Triton 教程导航
+│   ├── High level Introduction of triton/  # 高层导论（3章 + 1附录）
 │   └── triton_compiler_view_tutorial/   # 编译器设计视角（15章 + 5附录）
 │
 └── code/
@@ -62,6 +63,7 @@ my pytorch tutorial/
 
 | 教程 | 视角 | 篇幅 | 适合场景 |
 |------|------|------|---------|
+| **High level Introduction of triton** | 工程实践，高层全景 | 3章 + 1附录 | 快速建立 Triton 编译器整体认知 |
 | **triton_compiler_view_tutorial** | 编译器理论，映射 EaC + MLIR + GPU 教材 | 15章 + 5附录 | 系统性掌握 Triton 编译器全栈设计 |
 
 ---
@@ -111,6 +113,8 @@ my pytorch tutorial/
 ### Triton 编译器学习路线
 
 Triton 是 PyTorch Inductor 的默认代码生成后端，也是理解 GPU 编译器全栈技术的绝佳入口。
+
+**入门推荐**：先读 [High level Introduction of triton](Triton%20Introduction/High%20level%20Introduction%20of%20triton/)（3 章），快速建立 Triton kernel 全生命周期、编译器架构、Dialect/Pass Pipeline 的整体认知，再进入下方系统性的编译器理论教材。
 
 **详细目录见 [triton_compiler_view_tutorial/README.md](Triton%20Introduction/triton_compiler_view_tutorial/README.md)**
 
