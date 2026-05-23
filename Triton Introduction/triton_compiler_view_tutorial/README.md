@@ -92,7 +92,7 @@
 
 ### 第一部分：基础与全景
 
-#### 第 1 章：编译器设计导论与 Triton 全景
+#### [第 1 章：编译器设计导论与 Triton 全景](ch01_introduction.md)
 
 本章从零开始介绍编译器的基本概念——前端、中间表示（IR）、优化与后端，帮助读者建立编译器的世界观。随后介绍 GPU 编程模型（SIMT、内存层次、warp 调度）以及 ML 编译器生态地图（XLA、TVM、Halide、Triton 的定位）。最后给出 Triton 在 PyTorch 编译栈中的定位（`torch.compile -> Inductor -> Triton`）、其基于 tile 的核心编程哲学以及两级 IR（TTIR + TTGIR）的设计动机。
 
@@ -100,11 +100,11 @@
 
 ### 第二部分：前端——Triton DSL 与 TTIR
 
-#### 第 2 章：Triton 编程语言设计
+#### [第 2 章：Triton 编程语言设计](ch02_triton_dsl.md)
 
 本章深入 Triton DSL（`triton.language`）的设计。从 program/kernel/block/tile 的编程模型出发，逐一讲解 `tl.program_id`、`tl.arange`、`tl.load`、`tl.store` 等核心原语的语法与语义。分析 Python 作为 DSL 宿主语言的设计考量（嵌入式 DSL 的编译器理论），并与 CUDA C++、OpenCL 进行编程模型对比，揭示 Triton 以 tile（而非 thread）为基本编程单元的设计哲学。
 
-#### 第 3 章：MLIR 基础设施与 Triton IR（TTIR）设计
+#### [第 3 章：MLIR 基础设施与 Triton IR（TTIR）设计](ch03_mlir_ttir.md)
 
 本章首先系统讲解 MLIR 的核心概念——Operation、Dialect、Region、Block——建立 MLIR 作为可扩展编译器基础设施的认知框架。随后聚焦 TTIR 方言设计，深度剖析 `tt.make_range`、`tt.load`、`tt.store`、`tt.reduce`、`tt.dot` 等核心 Op 的语义定义（TableGen `.td` 文件）、SSA 结构与数据流图，并与 FX Graph、StableHLO 进行对比，阐明 Triton 为何选择自定义 MLIR 方言而非直接使用现有标准方言。
 
@@ -112,23 +112,23 @@
 
 ### 第三部分：中间层——TTGIR 与优化
 
-#### 第 4 章：TritonGPU IR（TTGIR）—— GPU 专属 IR 设计
+#### [第 4 章：TritonGPU IR（TTGIR）—— GPU 专属 IR 设计](ch04_ttgir_design.md)
 
 本章是本部分的基石章节，全面剖析 Triton 的第二级 IR——TTGIR。核心内容包括：（1）**Layout 系统**——`blocked`、`mma`、`dot_op`、`slice`、`shared`、`nvidia_mma`、`warp_specialized` 等 encoding 类型，以及它们如何编码数据在 GPU 线程和内存上的分布；（2）**Memory Space**——`global`、`shared`、`register` 的编译器语义；（3）**Layout 转换**——`ConvertLayoutOp` 的插入逻辑与正确性条件。本章揭示了 Triton 最核心的设计：用 Layout 抽象将硬件细节从数据流中解耦。
 
-#### 第 5 章：语义分析与类型系统
+#### [第 5 章：语义分析与类型系统](ch05_type_system.md)
 
 本章从编译器前端的类型检查与类型推断理论（EaC Ch.5）出发，深入剖析 Triton DSL 的类型系统实现。包括 `triton.language.semantic` 的语义检查逻辑、`dtype` 体系与 `constexpr` 机制、标量/指针/张量的类型层次、运算符重载与类型推导规则、Python 函数 inline 展开为 TTIR 操作序列的过程，以及编译期常量折叠（`constexpr`）在设计上的巧妙之处。
 
-#### 第 6 章：Lowering—— TTIR → TTGIR 的方言转换
+#### [第 6 章：Lowering—— TTIR → TTGIR 的方言转换](ch06_lowering_ttir_ttgir.md)
 
 本章聚焦 TTIR 到 TTGIR 的 lowering——这是 Triton 编译管线中最重要的方言转换。在 MLIR DialectConversion 框架的理论基础上，详细剖析 `TritonToTritonGPUPass` 的核心策略：为每个操作分配 Layout（数据 Layout 传播算法的形式化描述——前向传播与后向传播的不动点迭代）；当相邻操作的 Layout 不兼容时自动插入 `ConvertLayoutOp`；将硬件无关的 `tt.load`/`tt.store` 转换为硬件感知的 `ttg.local_load`/`ttg.local_store` + `ttg.async_copy`。
 
-#### 第 7 章：循环优化—— Tiling、Peeling 与展开
+#### [第 7 章：循环优化—— Tiling、Peeling 与展开](ch07_loop_optimization.md)
 
 本章系统讲解循环优化理论（EaC Ch.9）在 Triton 中的应用。涵盖循环分块（tiling/strip-mining）与 Triton tile-based 编程模型的天然亲和性、循环剥离（loop peeling）——`LoopPeeling` pass 的实现与决策逻辑、循环展开（unrolling）在 TTGIR 层的 warp-level 展开策略，以及依赖分析（loop-carried vs. loop-independent dependence）在决定优化可行性中的角色。
 
-#### 第 8 章：内存优化—— Coalescing、Layout 与 Shared Memory
+#### [第 8 章：内存优化—— Coalescing、Layout 与 Shared Memory](ch08_memory_optimization.md)
 
 本章从 GPU 内存层次（HBM → L2 → L1/Shared Memory → Register File）的理论基础出发，深入 Triton 的内存优化体系。涵盖合并访问（coalescing）的地址模式分析与 `CoalesceUtils` 优化 pass、Layout 系统与内存访问模式的对应关系、Shared Memory 分配（`AllocateSharedMemory` pass）、异步拷贝管线（`ttg.async_copy_global_to_local`）与数据预取策略，以及 Barrier/Membar 同步的插入逻辑。
 
@@ -136,19 +136,19 @@
 
 ### 第四部分：后端——代码生成与运行时
 
-#### 第 9 章：指令选择—— TTGIR → LLVM IR
+#### [第 9 章：指令选择—— TTGIR → LLVM IR](ch09_instruction_selection.md)
 
 本章深入 Triton 编译管线中最核心的代码生成环节——将 TTGIR 转换为 LLVM IR。在指令选择理论（EaC Ch.10：树模式匹配、DAG 覆盖）的基础上，逐一剖析 `ElementwiseOpToLLVM`（逐元素操作映射）、`ReduceOpToLLVM`（warp shuffle + shared memory 归约）、`DotOpToLLVM`（Tensor Core MMA 指令选择）、`LoadOpToLLVM`/`StoreOpToLLVM`（地址计算与 masking）、`ConvertLayoutOpToLLVM`（shared memory 中转的 layout 转换）以及控制流和扫描操作的 LLVM 映射。
 
-#### 第 10 章：软件流水线（Pipelining）与 Warp Specialization
+#### [第 10 章：软件流水线（Pipelining）与 Warp Specialization](ch10_pipeline_warp_spec.md)
 
 本章讲解 Triton 最精巧的性能优化技术。在指令调度理论（EaC Ch.11）框架下，剖析 Triton 的软件流水线系统：`PipelineExpander`（异步拷贝+等待的流水线展开）、`PipeliningUtility`（阶段划分与 barrier 插入）、乒乓 buffer 双缓冲策略。随后深入 Warp Specialization——`WarpSpecialization` pass 将 warp 划分为生产者/消费者角色，`WarpSpecializeUtility` 管理 warp group 分配与同步，以及 MMAv5 引入的 `MMAv5PipelineUtility` 管线。
 
-#### 第 11 章：寄存器分配与内存管理
+#### [第 11 章：寄存器分配与内存管理](ch11_register_allocation.md)
 
 本章从寄存器分配理论（EaC Ch.12：活跃范围分析、干涉图、图着色 Chaitin-Briggs 算法、线性扫描）出发，剖析 Triton 的内存管理层。涵盖 `Allocation` 分析（buffer 活跃范围、内存复用）、`BufferRegion` 分析（buffer 区域划分）、`AllocateSharedMemory`（scratch memory 分配）、`GlobalScratchMemoryAllocation`、以及 `Alias` 分析（指针别名关系与内存依赖）。最后讨论 Triton 如何将寄存器分配委托给 LLVM/NVPTX 后端的设计考量。
 
-#### 第 12 章：后端代码发射—— LLVM → PTX → CUBIN
+#### [第 12 章：后端代码发射—— LLVM → PTX → CUBIN](ch12_backend_code_emission.md)
 
 本章追踪代码生成的最后一公里：LLVM IR → NVPTX 后端 → PTX 汇编 → CUBIN（SASS）的完整翻译过程。在 LLVM 后端流水线简介（EaC Ch.13）的基础上，讲解 NVPTX 后端的翻译机制、PTX 汇编器的优化策略，以及 Triton 的多后端支持架构——NVIDIA（CUDA）、AMD（ROCm/HIP）、Ascend（昇腾 NPU）后端的插件接口与可移植性设计。
 
@@ -156,15 +156,15 @@
 
 ### 第五部分：集成、调优与展望
 
-#### 第 13 章：JIT 编译系统与缓存管理
+#### [第 13 章：JIT 编译系统与缓存管理](ch13_jit_cache.md)
 
 本章聚焦 Triton 的编译执行模型。讲解 JIT（Just-In-Time）编译的完整工作流程——从 `ASTSource` 到 `compile()` 到 IR passes 到 PTX/CUBIN 的全链路；编译缓存系统——`CacheManager` 的 hash-based 缓存键生成（源码 hash + 编译选项 + GPU 架构）、缓存失效策略、环境变量变更检测；异步编译（`_async_compile.py`，编译与执行重叠）；以及 AOT（Ahead-Of-Time）编译模式的实现。
 
-#### 第 14 章：Autotuning 系统
+#### [第 14 章：Autotuning 系统](ch14_autotuning.md)
 
 本章深入 Triton 的自动调优系统。在自动调优的编译器理论基础（经验搜索 vs. 模型驱动优化）上，剖析 `autotuner.py` 的架构——Config 空间定义（`BLOCK_SIZE`、`num_warps`、`num_stages`、`num_ctas`）、搜索策略（网格搜索、遗传算法、贝叶斯优化）、`OutOfResources` 检测与剪枝、`Heuristic` 模式与 `Autotuner` 模式的分工，以及与 PyTorch Inductor 的调优协同关系。
 
-#### 第 15 章：端到端编译流程回顾与展望
+#### [第 15 章：端到端编译流程回顾与展望](ch15_end_to_end.md)
 
 本章将全书所学串联为一条完整的编译管线：`@triton.jit → AST 构建 → TTIR 生成 → 类型推断 → TTIR passes → TTIR→TTGIR lowering → TTGIR passes (coalescing, pipelining, warp spec 等) → TTGIR→LLVM conversion → LLVM opt → NVPTX → PTX → CUBIN → kernel launch`。回顾各阶段间的数据接口与 IR 形态变化，总结 Triton 编译器设计中的关键权衡（两级 IR、Layout 抽象、Python-First、MLIR-Based），并展望未来方向——动态 shape、sparsity、flash attention 专用优化、MLIR-based 统一生态。
 
@@ -174,11 +174,11 @@
 
 | 附录 | 内容 |
 |------|------|
-| **附录 A** | *Engineering a Compiler* 章节完整映射——本书每小节与 EaC 教材的对应关系 |
-| **附录 B** | MLIR 核心概念速查——Operation、Dialect、Region、Block、Pass、Pattern Rewrite 等关键概念的定义与用法 |
-| **附录 C** | GPU 体系结构速查——NVIDIA（Ampere/Hopper）、AMD（CDNA）、Ascend（达芬奇）的硬件参数与编程模型对比 |
-| **附录 D** | 关键 TableGen 定义索引——TTIR/TTGIR 所有 Op、Type、Attribute 的完整 `.td` 定义路径索引 |
-| **附录 E** | 术语表——全书涉及的所有编译器、GPU、MLIR 术语的中英对照与释义 |
+| **[附录 A](appendix_a_eac_mapping.md)** | *Engineering a Compiler* 章节完整映射——本书每小节与 EaC 教材的对应关系 |
+| **[附录 B](appendix_b_mlir_primer.md)** | MLIR 核心概念速查——Operation、Dialect、Region、Block、Pass、Pattern Rewrite 等关键概念的定义与用法 |
+| **[附录 C](appendix_c_gpu_architecture.md)** | GPU 体系结构速查——NVIDIA（Ampere/Hopper）、AMD（CDNA）、Ascend（达芬奇）的硬件参数与编程模型对比 |
+| **[附录 D](appendix_d_tablegen_reference.md)** | 关键 TableGen 定义索引——TTIR/TTGIR 所有 Op、Type、Attribute 的完整 `.td` 定义路径索引 |
+| **[附录 E](appendix_e_glossary.md)** | 术语表——全书涉及的所有编译器、GPU、MLIR 术语的中英对照与释义 |
 
 ---
 
