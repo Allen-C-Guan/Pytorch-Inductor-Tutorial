@@ -48,13 +48,13 @@ Triton 采用了一种完全不同的前端设计策略：**将 DSL 嵌入到 Py
 
 ```mermaid
 flowchart TD
-    subgraph 传统编译器前端
+    subgraph "传统编译器前端"
         T1[文本源码] --> T2[Scanner → Tokens]
         T2 --> T3[Parser → AST]
         T3 --> T4[Semantic Analysis → IR]
     end
     
-    subgraph Triton嵌入式DSL前端
+    subgraph "Triton嵌入式DSL前端"
         E1["Python 函数 +<br/>@triton.jit 装饰器"] --> E2["Python 解释器自动<br/>完成词法/语法分析"]
         E2 --> E3["AST Visitor 遍历<br/>Python 的 AST"]
         E3 --> E4["CodeGenerator 执行<br/>语义分析 + IR 构建"]
@@ -291,14 +291,19 @@ classDiagram
         +shape: Tuple~constexpr~
         +dtype: dtype
         +numel: constexpr
-        +__add__, __mul__, etc.
-        +load() / store()
+        +__add__
+        +__mul__
+        +etc.
+        +load()
+        +store()
     }
     
     class constexpr {
         +value: Any
         +type: constexpr_type
-        +__add__, __mul__, etc.
+        +__add__
+        +__mul__
+        +etc.
     }
     
     class tuple {

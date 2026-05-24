@@ -484,7 +484,7 @@ classDiagram
         -Operation* op
         -Value value
         -size_t cost
-        -SmallVector~Node~ nodes (子节点)
+        -SmallVector~Node~ nodes
         -SmallVector~InputPort~ inputs
         -SmallVector~List~OutputPort~~ outputs
         -SetVector~Partition~ partitions
@@ -497,10 +497,10 @@ classDiagram
     }
     class Partition {
         -Graph* graph
-        -Flags flags (MANUAL, LOAD, STORE, MMA, TMEM, SFU, VIEW)
+        -Flags flags
         -size_t cost
         -SetVector~Node~ nodes
-        +getStage() size_t (MMA=1, else=0)
+        +getStage() size_t
     }
     class Edge {
         -OutputPort from

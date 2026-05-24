@@ -203,7 +203,6 @@ classDiagram
     }
 
     class BufferT {
-        <<enumeration>> BufferKind
         +BufferKind kind
         +BufferId id
         +Operation* owner
@@ -372,7 +371,7 @@ flowchart LR
     alloc2["alloc v2<br/>buffer B2"] --> yield2["..."]
     yield1 --> ba["scf.for 的<br/>block arg v3<br/>alias: {v1}"]
 
-    subgraph AliasInfo propagation
+    subgraph "AliasInfo propagation"
         direction TB
         A["v1: {v1}"] --> C["v3: {v1}"]
         B["v2: {v2}"]

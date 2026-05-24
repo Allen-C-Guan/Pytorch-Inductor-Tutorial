@@ -336,11 +336,11 @@ classDiagram
 
 ```mermaid
 sequenceDiagram
-    participant User as 用户代码 (Python)
+    participant User as "用户代码 (Python)"
     participant CG as CodeGenerator
-    participant Core as core.py (builtin fns)
+    participant Core as "core.py (builtin fns)"
     participant Sem as TritonSemantic
-    participant IR as ir.builder (C++)
+    participant IR as "ir.builder (C++)"
 
     User->>CG: x + y (AST BinOp)
     CG->>CG: visit_BinOp(node)
