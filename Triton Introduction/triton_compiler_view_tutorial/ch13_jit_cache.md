@@ -254,10 +254,12 @@ classDiagram
         +submit(key, compile_fn, finalize_fn): FutureKernel
     }
 
+    class compile_fn["compile()"]
+
     JITCallable <|-- JITFunction
     JITFunction --> ASTSource : creates
-    ASTSource --> compile() : feeds into
-    compile() --> CompiledKernel : returns
+    ASTSource --> compile_fn : feeds into
+    compile_fn --> CompiledKernel : returns
     CacheManager <|-- FileCacheManager
     CacheManager <|-- RemoteCacheManager
     AsyncCompileMode --> FutureKernel : creates

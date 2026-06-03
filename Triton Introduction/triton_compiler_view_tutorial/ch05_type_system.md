@@ -319,7 +319,7 @@ classDiagram
     block_type --> dtype : element_ty
     constexpr --> constexpr_type : type
 
-    note for dtype "模块级单例:\nvoid, int1, int8, int16, int32, int64,\nuint8, uint16, uint32, uint64,\nfloat8e5, float8e4nv, float8e4b15,\nfloat16, bfloat16, float32, float64"
+    note "模块级单例:\nvoid, int1, int8, int16, int32, int64,\nuint8, uint16, uint32, uint64,\nfloat8e5, float8e4nv, float8e4b15,\nfloat16, bfloat16, float32, float64" for dtype
 ```
 
 **关键设计要点**：

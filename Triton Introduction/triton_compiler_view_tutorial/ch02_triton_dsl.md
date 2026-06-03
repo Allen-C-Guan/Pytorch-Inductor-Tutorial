@@ -547,7 +547,7 @@ Tile-first 编程模型不仅仅是一种语法选择——它深刻影响了 Tr
 
 ```mermaid
 flowchart LR
-    subgraph CUDA/OpenCL
+    subgraph "CUDA/OpenCL"
         C1["Thread-First<br/>一个函数描述一个 thread 的行为"] --> C2["显式管理索引<br/>threadIdx + blockIdx + blockDim"]
         C2 --> C3["显式硬件映射<br/>thread → warp → SM"]
     end

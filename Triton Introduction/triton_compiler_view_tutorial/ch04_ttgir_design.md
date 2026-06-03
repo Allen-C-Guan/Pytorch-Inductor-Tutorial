@@ -358,10 +358,10 @@ classDiagram
 
     LayoutEncodingTrait <|.. NVMMASharedEncodingAttr
 
-    note for LayoutEncodingTrait "基类接口\n所有 Layout 共有"
-    note for DistributedEncodingTrait "分布式编码\n数据分布在 register→lane→warp→block"
-    note for SharedEncodingTrait "共享内存编码\n数据以 offset→dim0..dimN 映射到 shared memory"
-    note for MmaEncodingTrait "MMA 编码标记\nTiled 的矩阵乘法输出布局"
+    note "基类接口\n所有 Layout 共有" for LayoutEncodingTrait
+    note "分布式编码\n数据分布在 register→lane→warp→block" for DistributedEncodingTrait
+    note "共享内存编码\n数据以 offset→dim0..dimN 映射到 shared memory" for SharedEncodingTrait
+    note "MMA 编码标记\nTiled 的矩阵乘法输出布局" for MmaEncodingTrait
 ```
 
 **图 4-1: TTGIR Layout 编码体系的完整 UML 类图。** 左侧为 Distributed Encoding 分支（寄存器中的分布式张量），右侧为 Shared Encoding 分支（共享内存中的张量描述符）。两类 Layout 都实现了 `LayoutEncodingTrait` 接口，但各自的语义和参数截然不同。
