@@ -1,4 +1,4 @@
-# PyTorch（inductor/triton）编译器技术栈教学（持续补充中）
+# PyTorch（inductor/triton/MLIR）编译器技术栈教学（持续补充中）
 
 系统性的 PyTorch 编译器技术栈源码教学材料，覆盖 **Inductor 编译器**、**Triton 编译器** 与 **MLIR 编译器基础设施** 三大核心，面向准备从事 ML 编译器开发的工程师，以专家视角提供从全局架构到关键代码的完整学习路径。
 
