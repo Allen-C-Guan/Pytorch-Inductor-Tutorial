@@ -628,4 +628,3 @@ Convolution `input` 的访问模式是 `(n, oh * sh + fh * dh, ow * sw + fw * dw
 > 版权声明：本文为博主原创文章，遵循 CC 4.0 BY-SA 版权协议，转载请附上原文出处链接和本声明。  
 > 本文链接：https://www.lei.chat/zh/posts/mlir-vector-dialect-and-patterns/
 > 版权归原作者所有，侵删。
-
