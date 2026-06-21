@@ -72,12 +72,13 @@ triton_compiler_view_tutorial      第 13-15 章  理解运行时系统
 | 完整编译流程回顾 | [第 15 章](triton_compiler_view_tutorial/ch15_end_to_end.md) |
 | 术语速查 | [附录 E](triton_compiler_view_tutorial/appendix_e_glossary.md) |
 
-## 与 Inductor 教程的关系
+## 与 Inductor / MLIR 教程的关系
 
-Triton 是 PyTorch Inductor 的默认 GPU 代码生成后端。Inductor 生成 Triton 代码，Triton 编译器将其编译为 GPU 可执行文件。建议：
+Triton 是 PyTorch Inductor 的默认 GPU 代码生成后端。Inductor 生成 Triton 代码，Triton 编译器将其编译为 GPU 可执行文件。同时，Triton 编译器**本身基于 MLIR 构建**（TTIR、TTGIR 均为 MLIR Dialect），因此 MLIR 教程是理解 Triton 内部设计的前置知识。
 
-- **先学 Inductor 再学 Triton**：理解上层调度、融合决策后再深入底层代码生成
-- **先学 Triton 再学 Inductor**：理解 GPU kernel 编译原理后，更容易理解 Inductor 的 codegen 策略
-- **并行对照学习**：两套教程对照阅读，建立 Inductor ↔ Triton 的完整技术栈认知
+- **MLIR 教程（前置推荐）**：Triton 的两级 IR、Dialect 定义、Pass Pipeline、DialectConversion 等设计均建立在 MLIR 之上。建议先读 MLIR 教程建立基础设施认知——第一阶段 [MLIR high level overview](../MLIR/MLIR%20high%20level%20overview/) 讲清 Dialect 体系与变换管线，第二阶段 [compiler-view-of-MLIR](../MLIR/compiler-view-of-MLIR/) 深入 IR 表示、def-use chain、图重写等机制。
+- **Inductor 教程**：理解上层调度、融合决策后再深入底层代码生成；或反过来，理解 GPU kernel 编译原理后，更容易理解 Inductor 的 codegen 策略。
+- **并行对照学习**：MLIR → Triton → Inductor 三套教程对照阅读，建立从底层基础设施到上层编译栈的完整技术链认知。
 
+MLIR 教程入口：[../MLIR/](../MLIR/)
 Inductor 教程入口：[../Inductor%20Introduction/](../Inductor%20Introduction/)

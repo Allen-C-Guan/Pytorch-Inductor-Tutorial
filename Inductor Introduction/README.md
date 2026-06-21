@@ -1,10 +1,10 @@
 # Introduction —— PyTorch Inductor 入门学习材料集
 
-> 本目录包含从不同维度学习 PyTorch Inductor 的系统性教程与笔记。
+> 本目录包含从不同维度学习 PyTorch Inductor 的系统性教程。其中 **compiler_view_tutorial 是核心教程**，另外两套教程从管线阶段与类设计角度提供互补视角。
 
 ## 内容导航
 
-### [compiler_view_tutorial/](compiler_view_tutorial/) — 编译器设计视角
+### [compiler_view_tutorial/](compiler_view_tutorial/) — 编译器设计视角【核心教程】
 
 以 *Engineering a Compiler* 为骨架，将 Inductor 的各个模块映射到编译器的经典阶段。从编译器理论的宏观视角理解 Inductor 的架构设计，共 12 章 + 2 附录。
 
@@ -22,35 +22,18 @@
 
 **适合**：希望快速了解编译管线的各阶段边界和数据流转。
 
-### [key_code_tutorial/](key_code_tutorial/) — 调试指南
-
-Dynamo 和 Inductor 的调试实战指南，涵盖常用调试技巧、日志配置和问题定位方法。
-
-**适合**：在实际开发中遇到问题需要定位和调试。
-
-### [my notes/](my%20notes/) — 个人笔记
-
-编译器设计原理的个人学习笔记和读后感。
-
-### [Engineering_a_Compiler/](Engineering_a_Compiler/) — 教材章节总结
-
-*Engineering a Compiler* 各章节的中文总结。
-
 ## 推荐阅读顺序
 
 ```
 首次学习路线：
 
-compiler_view_tutorial (Ch.1-2)     建立 Inductor 全局认知
+compiler_view_tutorial (Ch.1-2)     建立 Inductor 全局认知（核心入口）
         │
         v
 key_classes_analysis (Ch.1-9)       深入源码与类设计
         │
         v
 skeleton_tutorial                    对照编译管线各阶段
-        │
-        v
-key_code_tutorial                    调试实战
 ```
 
 > 也可以根据当前需要直接跳转到对应模块——每个子目录都是自包含的。
