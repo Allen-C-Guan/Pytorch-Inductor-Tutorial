@@ -1,10 +1,11 @@
-# PyTorch（inductor/triton/MLIR）编译器技术栈教学（持续补充中）
+# PyTorch 编译器技术栈 + 基础算子教学（inductor / operator / triton / MLIR）（持续补充中）
 
-系统性的 PyTorch 编译器技术栈源码教学材料，覆盖 **Inductor 编译器**、**Triton 编译器** 与 **MLIR 编译器基础设施** 三大核心，面向准备从事 ML 编译器开发的工程师，以专家视角提供从全局架构到关键代码的完整学习路径。
+系统性的 PyTorch 编译器技术栈源码教学材料，按 **Inductor → operator → Triton → MLIR** 的顺序组织四大核心：**Inductor 编译器**、**基础算子（ATen Ops）**、**Triton 编译器** 与 **MLIR 编译器基础设施**，面向准备从事 ML 编译器开发的工程师，以专家视角提供从全局架构到关键代码的完整学习路径。
 
 ## 教学目标
 
 - **Inductor**：理解 PyTorch 2 编译管线的完整架构——Dynamo 追踪 → FX 图优化 → Lowering → 调度与融合 → 代码生成
+- **operator（基础算子）**：理解被 Inductor 编译的对象——ATen 基础算子到底在做什么（数学语义 / 操作逻辑 / 在模型里的角色），尤其是难懂的「操作类算子」（as_strided / gather / scatter …），以及每个算子在 Inductor 中走哪条降级路径（pointwise / reduction / template / fallback）
 - **Triton**：理解 Triton 编译器的全栈设计——从 DSL 前端（TTIR）到 GPU 后端（TTGIR → LLVM IR → PTX → CUBIN）
 - **MLIR**：理解 MLIR 编译器基础设施的设计哲学——先从全局俯瞰（编译器/IR 演进史、Dialect 体系、渐进式递降），再以编译器学科视角逐层拆解其工作机制（IR 表示、def-use chain、重写范式）
 - 掌握每个阶段的设计动机、编译器理论基础与源码实现细节
@@ -32,6 +33,12 @@ my pytorch tutorial/
 │   ├── skeleton_tutorial/               # 管线阶段视角（5个 phase）
 │   └── key_classes_analysis/            # OOP/类设计视角（9章 + 附录）
 │
+├── operator/                            # 基础算子（ATen Ops）教程：以 Inductor/编译器视角看算子
+│   ├── README.md                        # 算子书导航（含 161 算子速查）
+│   ├── 00-…~16-…                        # 17 章：张量基底 + 数学类 + 操作类 + 模型层原语
+│   ├── stride-essence.md                # stride 本质深度专题
+│   └── appendix-b/c                     # 复合→基础分解 cookbook、Inductor 降级速查
+│
 ├── Triton Introduction/                 # Triton 编译器教程
 │   ├── README.md                        # Triton 教程导航
 │   ├── High level Introduction of triton/  # 高层导论（3章 + 1附录）
@@ -51,7 +58,7 @@ my pytorch tutorial/
 
 ---
 
-## 三大教程体系
+## 四大教程体系
 
 ### Inductor 编译器教程 → [Inductor Introduction/](Inductor%20Introduction/)
 
@@ -62,6 +69,22 @@ my pytorch tutorial/
 | **compiler_view_tutorial**（核心） | 编译器理论，映射 EaC 教材 | 12章 + 2附录 | 建立整体认知框架 |
 | **skeleton_tutorial** | 编译管线阶段，12节标准化模板 | 5个 phase | 快速了解各阶段边界与数据流 |
 | **key_classes_analysis** | OOP/类设计，类继承树与协作关系 | 9章 + 附录 | 深入源码理解"为什么这样设计" |
+
+### operator 基础算子教程 → [operator/](operator/)
+
+> **定位**：在理解「Inductor 怎么编译」之前，先看懂「被编译的算子在干什么」。它是三大编译器教程的**算子前置知识**——Inductor 的输入就是一张由 `aten.*` 算子组成的计算图。
+
+以「位置保持 vs 位置变化」为分类轴，系统讲解 Core ATen 全 161 个基础算子的功能：数学公式 / 操作逻辑 / 实现复杂度 / 在模型里的角色，并标注每个算子在 Inductor 中走哪条降级路径。重心放在**操作类算子**（as_strided / gather / scatter / sort … 这些「不在算数学、而在搬运/重排/索引」的算子）。
+
+**详细目录见 [operator/README.md](operator/README.md)**
+
+| 部分 | 章节 | 核心内容 |
+|------|------|---------|
+| 前置 | [第 0 章 张量基底](operator/00-tensor-substrate.md) · [stride 本质](operator/stride-essence.md) | shape/dtype/stride/广播/类型提升/SSA 契约；stride 的数学本质与「能做/不能做」边界 |
+| Part I 数学语义类 | [第 1 章](operator/01-elementwise-arithmetic.md) · [第 2 章](operator/02-transcendental.md) · [第 3 章](operator/03-comparison-boolean.md) · [第 4 章](operator/04-reductions.md) · [第 5 章](operator/05-linear-algebra-core.md) · [第 6 章](operator/06-activations.md) | 逐元素算术、三角与超越、比较/布尔/位运算、规约、线性代数核心、激活函数 |
+| Part II 张量操作类（重心） | [第 7 章](operator/07-shape-and-view.md) · [第 8 章](operator/08-concat-split.md) · [第 9 章](operator/09-indexing-family.md) · [第 10 章](operator/10-sort-topk.md) · [第 11 章](operator/11-creation-filling.md) · [第 12 章](operator/12-memory-layout-dtype.md) | 形状与视图、拼接与切分、索引家族（最难）、排序与选取、创建与填充、内存布局与类型转换 |
+| Part III 模型层原语 | [第 13 章](operator/13-convolution.md) · [第 14 章](operator/14-pooling.md) · [第 15 章](operator/15-normalization.md) · [第 16 章](operator/16-padding-upsampling-distance.md) | 卷积、池化、归一化、填充/上采样/采样 |
+| 附录 | [附录 B 复合→基础分解](operator/appendix-b-decompositions.md) · [附录 C Inductor 降级速查](operator/appendix-c-inductor-cheatsheet.md) | silu/gelu/softmax… 如何分解；每类算子走 pointwise/reduction/template/fallback 哪条路 |
 
 ### Triton 编译器教程 → [Triton Introduction/](Triton%20Introduction/)
 
@@ -125,6 +148,15 @@ MLIR 教程采用**两阶段**结构，先建立全景再深入机制：
 | [第 8 章](Inductor%20Introduction/key_classes_analysis/chapter08_wrapper_codegen.md) | Wrapper 代码生成 |
 | [第 9 章](Inductor%20Introduction/key_classes_analysis/chapter09_end_to_end.md) | 端到端流程串联 |
 
+### operator 基础算子学习路线
+
+读懂 Inductor 编译的对象。建议在通读 Inductor 教程后、深入各算子 lowering 前切入。
+
+1. **[第 0 章 张量基底](operator/00-tensor-substrate.md)** — shape/dtype/stride/contiguity/广播/类型提升，建立全书「位置保持 vs 位置变化」分类轴
+2. **[stride 的本质](operator/stride-essence.md)** — 一块一维内存如何假装成任意多维张量，讲透 stride「能做 / 不能做」的精确边界
+3. **按轴阅读**：先 Part I（数学语义类，第 1–6 章）建立直觉，再进入 Part II（张量操作类，第 7–12 章，**全书重心**），最后 Part III（模型层原语，第 13–16 章）
+4. **[附录 C Inductor 降级速查](operator/appendix-c-inductor-cheatsheet.md)** — 查每个算子走 pointwise / reduction / template / fallback 的哪条路（torch 2.7.1）
+
 ### Triton 编译器学习路线
 
 Triton 是 PyTorch Inductor 的默认代码生成后端，也是理解 GPU 编译器全栈技术的绝佳入口。
@@ -184,7 +216,9 @@ MLIR 学习分两阶段推进：**先建立全景，再深入机制**。
 
 ## 编译器理论教材映射
 
-三个编译器教程均以 *Engineering a Compiler* (3rd Edition) 为理论骨架，以下是关键映射：
+三大编译器教程（Inductor / Triton / MLIR）均以 *Engineering a Compiler* (3rd Edition) 为理论骨架，以下是关键映射。
+
+> **operator 教程不在此列**：它不是以 EaC 为骨架的编译器教材，而是以「算子分类轴」（位置保持 vs 位置变化）组织的**算子功能手册**，定位为三大编译器教程的算子前置知识——EaC 阶段表里的任何一行，落到 Inductor 源码里的具体处理对象，都可在 [operator/](operator/) 找到对应算子的功能与降级路径讲解。
 
 | EaC 章节 | 主题 | Inductor 对应模块 | Triton 对应模块 | MLIR 对应内容 |
 |----------|------|------------------|----------------|-------------|
