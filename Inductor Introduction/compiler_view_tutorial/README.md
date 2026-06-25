@@ -32,6 +32,7 @@
 ### 第二部分：前端——图构建与中间表示
 
 - [第 3 章：Inductor 中间表示设计](ch03_ir_design.md)
+  - 📖 延伸专题：[Inductor IR 的设计抽象哲学——从指令流到空间变换的范式革命](inductor_ir_design_philosophy.md)（第 3 章高层纲领，建议先读）
 
 ### 第三部分：中间层——翻译与优化
 

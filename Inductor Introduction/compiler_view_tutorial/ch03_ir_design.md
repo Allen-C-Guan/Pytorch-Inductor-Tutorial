@@ -8,6 +8,12 @@
 
 本章是全书最重要的章节之一。Inductor 的 IR（Intermediate Representation，中间表示）是编译器的核心数据结构——它定义了编译器"看到"的程序是什么样的，直接决定了优化和代码生成的能力。
 
+> 📖 **延伸阅读（高层纲领）**
+>
+> 在深入本章的具体数据结构之前，强烈建议先阅读专题文章 **[《Inductor IR 的设计抽象哲学——从指令流到空间变换的范式革命》](inductor_ir_design_philosophy.md)**。它揭示了 Inductor IR 与传统编译器 IR（LLVM IR / MLIR）在根本范式上的分歧：Inductor IR 描述的是**"声明式的计算闭包与内存抽象"**，而非"过程式的指令流"。带着 LLVM/MLIR 的固有视角直接读源码会感到强烈的脱节——先建立这个高层心智模型，再回读本章乃至后续的 Lowering、Scheduler、Codegen 章节才会豁然开朗。
+>
+> **推荐阅读方式**：先通读该专题建立宏观图景 → 回到本章逐节深入具体实现 → 后续章节遇到困惑时随时回查对应专题。
+
 **学习目标：**
 - 理解 IR 设计的基本理论：SSA、基本块、CFG
 - 掌握 Inductor IR 的类层次结构：IRNode、Loops、Buffer、TensorBox/StorageBox
