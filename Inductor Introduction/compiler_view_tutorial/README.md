@@ -27,6 +27,7 @@
 ### 第一部分：基础与全景
 
 - [第 1 章：编译器设计导论与 Inductor 全景](ch01_introduction.md)
+  - 📖 延伸专题：[一文看穿 Inductor：`torch.compile` 五层编译全记录——循环与寄存器在最末才出生的编译之旅](inductor_full_tour.md)（第 1 章具象全景，建议先读）
 - [第 2 章：Python 字节码追踪与 FX Graph 构建](ch02_fx_graph.md)
 
 ### 第二部分：前端——图构建与中间表示
@@ -58,6 +59,8 @@
 - [附录 B：术语表](appendix_b_glossary.md)
 
 ## 阅读路线图
+
+> 💡 **入门第一站**：建议先通读 [《一文看穿 Inductor：`torch.compile` 五层编译全记录》](inductor_full_tour.md)——它跟着真实例子（`exp(A+B)`、`softmax`）走完 Inductor 全部 5 层管线，逐一展示真实中间产物（FX graph、IR、融合日志、Triton 核），是全书最快捷的"全景导览"。建立产物级心智模型后，再进入下面的章节路线图。
 
 ```
 ┌──────────────────────────────────────────────┐
