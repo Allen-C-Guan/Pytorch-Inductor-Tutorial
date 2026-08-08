@@ -1,4 +1,4 @@
-# PyTorch 编译器技术栈 + 基础算子教学（inductor / operator / triton / MLIR）（持续补充中）
+# PyTorch 编译器技术栈（inductor / operator / triton / MLIR）（持续补充中）
 
 系统性的 PyTorch 编译器技术栈源码教学材料，按 **Inductor → operator → Triton → MLIR** 的顺序组织四大核心：**Inductor 编译器**、**基础算子（ATen Ops）**、**Triton 编译器** 与 **MLIR 编译器基础设施**，面向准备从事 ML 编译器开发的工程师，以专家视角提供从全局架构到关键代码的完整学习路径。
 
