@@ -1,6 +1,8 @@
 # PyTorch Inductor 核心类剖析
 
 > *Core Classes Analysis — A Deep Dive into Inductor's Class Hierarchy and Design*
+>
+> 返回：[← Inductor 教程导航](../README.md)
 
 ## 关于本系列
 

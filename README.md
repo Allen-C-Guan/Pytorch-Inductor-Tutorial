@@ -29,24 +29,24 @@ my pytorch tutorial/
 │
 ├── Inductor Introduction/               # Inductor 编译器教程
 │   ├── README.md                        # Inductor 教程导航
-│   ├── compiler_view_tutorial/          # 【核心】编译器设计视角（12章 + 2附录）
+│   ├── compiler_view_tutorial/          # ⭐【核心】编译器设计视角（12章 + 2附录）
 │   ├── skeleton_tutorial/               # 管线阶段视角（5个 phase）
 │   └── key_classes_analysis/            # OOP/类设计视角（9章 + 附录）
 │
 ├── operator/                            # 基础算子（ATen Ops）教程：以 Inductor/编译器视角看算子
-│   ├── README.md                        # 算子书导航（含 161 算子速查）
+│   ├── README.md                        # ⭐【核心】算子书导航（含 161 算子速查）
 │   ├── 00-…~16-…                        # 17 章：张量基底 + 数学类 + 操作类 + 模型层原语
 │   ├── stride-essence.md                # stride 本质深度专题
 │   └── appendix-b/c                     # 复合→基础分解 cookbook、Inductor 降级速查
 │
 ├── Triton Introduction/                 # Triton 编译器教程
 │   ├── README.md                        # Triton 教程导航
-│   ├── High level Introduction of triton/  # 高层导论（3章 + 1附录）
+│   ├── High level Introduction of triton/  # ⭐【核心】高层导论（3章 + 1附录）
 │   └── triton_compiler_view_tutorial/   # 编译器设计视角（15章 + 5附录）
 │
 ├── MLIR/                                # MLIR 编译器基础设施教程
 │   ├── README.md                        # MLIR 教程导航
-│   ├── MLIR high level overview/        # 第一阶段：高层概述（4章，含 Linalg/Vector Dialect 深度解析）
+│   ├── MLIR high level overview/        # ⭐【核心】第一阶段：高层概述（4章）
 │   └── compiler-view-of-MLIR/           # 第二阶段：编译器视角教材（Ch0-Ch13）
 │
 └── code/
@@ -90,8 +90,8 @@ my pytorch tutorial/
 
 | 教程 | 视角 | 篇幅 | 适合场景 |
 |------|------|------|---------|
-| **High level Introduction of triton** | 工程实践，高层全景 | 3章 + 1附录 | 快速建立 Triton 编译器整体认知 |
-| **triton_compiler_view_tutorial** | 编译器理论，映射 EaC + MLIR + GPU 教材 | 15章 + 5附录 | 系统性掌握 Triton 编译器全栈设计 |
+| ⭐ **High level Introduction of triton** | 工程实践，高层全景 | 3章 + 1附录 | **入门最佳起点**，快速建立 Triton 编译器整体认知 |
+| **triton_compiler_view_tutorial** | 编译器理论，映射 EaC + MLIR + GPU 教材 | 15章 + 5附录 | 系统深度学习，适合完成 High level 后深入 |
 
 ### MLIR 编译器基础设施教程 → [MLIR/](MLIR/)
 
@@ -99,8 +99,8 @@ MLIR 教程采用**两阶段**结构，先建立全景再深入机制：
 
 | 教程 | 视角 | 篇幅 | 适合场景 |
 |------|------|------|---------|
-| **MLIR high level overview**（第一阶段） | 编译器/IR 演进史 + Dialect 体系 + 变换管线 | 4 章 | 理解 MLIR 设计哲学与结构化代码生成的宏观图景 |
-| **compiler-view-of-MLIR**（第二阶段） | 编译器学科镜头下的 MLIR 工作机制 | Ch0–Ch13 | 逐层拆解 IR 表示、def-use chain、图重写范式等核心机制 |
+| ⭐ **MLIR high level overview**（第一阶段） | 编译器/IR 演进史 + Dialect 体系 + 变换管线 | 4 章 | 理解 MLIR 设计哲学与结构化代码生成的宏观图景 |
+| **compiler-view-of-MLIR**（第二阶段） | 编译器学科镜头下的 MLIR 工作机制 | Ch0–Ch13 | 系统深入学习 IR 表示、def-use chain、图重写等核心机制 |
 
 第一阶段从 LLVM IR → SPIR-V → MLIR 的演进逻辑出发，讲清 Linalg/Vector Dialect 如何协同完成渐进式递降（Progressive Lowering）；由 MLIR/SPIR-V 核心开发者 Lei Zhang 撰写。第二阶段则以编译器学科谱系为镜头，把 MLIR 当作编译器教材的一员来审视——它回答了哪些经典问题、用了什么新抽象、相比 LLVM/GCC/Sea of Nodes 做了哪些取舍。两阶段从"宏观图景"递进到"机制内幕"，与 Triton 编译器教程形成互补（Triton 编译器本身基于 MLIR 构建）。
 
@@ -127,8 +127,8 @@ MLIR 教程采用**两阶段**结构，先建立全景再深入机制：
 | 基础与全景 | [第 1 章](Inductor%20Introduction/compiler_view_tutorial/ch01_introduction.md) · [第 2 章](Inductor%20Introduction/compiler_view_tutorial/ch02_fx_graph.md) | 编译器设计导论、Dynamo 字节码追踪与 FX Graph |
 | 前端 | [第 3 章](Inductor%20Introduction/compiler_view_tutorial/ch03_ir_design.md) | Inductor IR 设计 |
 | 中间层 | [第 4 章](Inductor%20Introduction/compiler_view_tutorial/ch04_lowering.md) · [第 5 章](Inductor%20Introduction/compiler_view_tutorial/ch05_optimization.md) | Lowering、图优化 |
-| 后端 | [第 6 章](Inductor%20Introduction/compiler_view_tutorial/ch06_dependency.md) · [第 7 章](Inductor%20Introduction/compiler_view_tutorial/ch07_fusion.md) · [第 8 章](Inductor%20Introduction/compiler_view_tutorial/ch08_codegen.md) · [第 9 章](Inductor%20Introduction/compiler_view_tutorial/ch09_memory.md) · [第 10 章](Inductor%20Introduction/compiler_view_tutorial/ch10_scheduling.md) | 依赖分析、融合、代码生成、内存管理、指令调度 |
-| 集成与展望 | [第 11 章](Inductor%20Introduction/compiler_view_tutorial/ch11_e2e_pipeline.md) · [第 12 章](Inductor%20Introduction/compiler_view_tutorial/ch12_ecosystem.md) | 端到端流程回顾、PyTorch 生态协同 |
+| 后端 | [第 6 章](Inductor%20Introduction/compiler_view_tutorial/ch06_dependency.md) · [第 7 章](Inductor%20Introduction/compiler_view_tutorial/ch07_fusion.md) · [第 8 章](Inductor%20Introduction/compiler_view_tutorial/ch08_codegen.md) · [第 9 章](Inductor%20Introduction/compiler_view_tutorial/ch09_memory.md) · [第 10 章](Inductor%20Introduction/compiler_view_tutorial/ch10_instruction_scheduling.md) | 依赖分析、融合、代码生成、内存管理、指令调度 |
+| 集成与展望 | [第 11 章](Inductor%20Introduction/compiler_view_tutorial/ch11_e2e_compilation.md) · [第 12 章](Inductor%20Introduction/compiler_view_tutorial/ch12_ecosystem.md) | 端到端流程回顾、PyTorch 生态协同 |
 
 #### 第三阶段：核心类设计
 
@@ -161,25 +161,9 @@ MLIR 教程采用**两阶段**结构，先建立全景再深入机制：
 
 Triton 是 PyTorch Inductor 的默认代码生成后端，也是理解 GPU 编译器全栈技术的绝佳入口。
 
-**入门推荐**：先读 [High level Introduction of triton](Triton%20Introduction/High%20level%20Introduction%20of%20triton/)（3 章），快速建立 Triton kernel 全生命周期、编译器架构、Dialect/Pass Pipeline 的整体认知，再进入下方系统性的编译器理论教材。
+⭐ **入门最佳起点**：[High level Introduction of triton](Triton%20Introduction/High%20level%20Introduction%20of%20triton/)（3 章 + 1 附录），以工程实践视角覆盖 kernel 全生命周期、编译器架构全景与多后端适配、Dialect 与 Pass Pipeline 设计，快速建立 Triton 编译器整体认知。
 
-**详细目录见 [triton_compiler_view_tutorial/README.md](Triton%20Introduction/triton_compiler_view_tutorial/README.md)**
-
-| 部分 | 章节 | 核心内容 |
-|------|------|---------|
-| 基础与全景 | [第 1 章](Triton%20Introduction/triton_compiler_view_tutorial/ch01_introduction.md) | 编译器设计导论与 Triton 全景 |
-| 前端 | [第 2 章](Triton%20Introduction/triton_compiler_view_tutorial/ch02_triton_dsl.md) · [第 3 章](Triton%20Introduction/triton_compiler_view_tutorial/ch03_mlir_ttir.md) | Triton DSL 设计、MLIR 与 TTIR |
-| 中间层 | [第 4 章](Triton%20Introduction/triton_compiler_view_tutorial/ch04_ttgir_design.md) · [第 5 章](Triton%20Introduction/triton_compiler_view_tutorial/ch05_type_system.md) · [第 6 章](Triton%20Introduction/triton_compiler_view_tutorial/ch06_lowering_ttir_ttgir.md) · [第 7 章](Triton%20Introduction/triton_compiler_view_tutorial/ch07_loop_optimization.md) · [第 8 章](Triton%20Introduction/triton_compiler_view_tutorial/ch08_memory_optimization.md) | TTGIR 设计、类型系统、Lowering、循环优化、内存优化 |
-| 后端 | [第 9 章](Triton%20Introduction/triton_compiler_view_tutorial/ch09_instruction_selection.md) · [第 10 章](Triton%20Introduction/triton_compiler_view_tutorial/ch10_pipeline_warp_spec.md) · [第 11 章](Triton%20Introduction/triton_compiler_view_tutorial/ch11_register_allocation.md) · [第 12 章](Triton%20Introduction/triton_compiler_view_tutorial/ch12_backend_code_emission.md) | 指令选择、流水线/Warp Spec、寄存器分配、PTX/CUBIN 发射 |
-| 集成与展望 | [第 13 章](Triton%20Introduction/triton_compiler_view_tutorial/ch13_jit_cache.md) · [第 14 章](Triton%20Introduction/triton_compiler_view_tutorial/ch14_autotuning.md) · [第 15 章](Triton%20Introduction/triton_compiler_view_tutorial/ch15_end_to_end.md) | JIT 与缓存、Autotuning、端到端回顾 |
-
-| 附录 | 内容 |
-|------|------|
-| [附录 A](Triton%20Introduction/triton_compiler_view_tutorial/appendix_a_eac_mapping.md) | EaC 章节完整映射 |
-| [附录 B](Triton%20Introduction/triton_compiler_view_tutorial/appendix_b_mlir_primer.md) | MLIR 核心概念速查 |
-| [附录 C](Triton%20Introduction/triton_compiler_view_tutorial/appendix_c_gpu_architecture.md) | GPU 体系结构速查 |
-| [附录 D](Triton%20Introduction/triton_compiler_view_tutorial/appendix_d_tablegen_reference.md) | TableGen 定义索引 |
-| [附录 E](Triton%20Introduction/triton_compiler_view_tutorial/appendix_e_glossary.md) | 术语表 |
+需要系统深入学习时，[triton_compiler_view_tutorial](Triton%20Introduction/triton_compiler_view_tutorial/)（15 章 + 5 附录）以编译器理论为骨架逐章拆解 Triton 全栈设计。详细目录见 [triton_compiler_view_tutorial/README.md](Triton%20Introduction/triton_compiler_view_tutorial/README.md)。
 
 ### MLIR 学习路线
 
@@ -198,19 +182,7 @@ MLIR 学习分两阶段推进：**先建立全景，再深入机制**。
 
 #### 第二阶段：compiler-view-of-MLIR（机制内幕）
 
-以编译器学科为镜头逐章拆解 MLIR 的工作机制——IR 如何被表示、构造、重写、销毁，共 **Ch0–Ch13**。
-
-**详细目录见 [compiler-view-of-MLIR/README.md](MLIR/compiler-view-of-MLIR/README.md)**
-
-| 部分 | 章节 | 核心内容 |
-|------|------|---------|
-| 导论 | [Ch0](MLIR/compiler-view-of-MLIR/00-MLIR在编译器学科中的位置.md) · [Ch1](MLIR/compiler-view-of-MLIR/01-MLIRContext-对象的所有权与唯一化.md) | MLIR 在编译器学科中的位置、MLIRContext 的所有权与唯一化 |
-| IR 逻辑结构 | [Ch2](MLIR/compiler-view-of-MLIR/02-Operation-一切皆操作及其部件语义.md) · [Ch3](MLIR/compiler-view-of-MLIR/03-Block-Region与控制流结构.md) | Operation 部件语义、Block/Region 与控制流结构 |
-| 数据流边 | [Ch4](MLIR/compiler-view-of-MLIR/04-def-use-chain-从数据流分析到use-list实现.md) | def-use chain 从数据流分析到 use-list 实现 |
-| IR 遍历 | [Ch5](MLIR/compiler-view-of-MLIR/05-遍历IR-walk-predecessor与变更契约.md) | walk、predecessor 与变更契约 |
-| IR 构建 | [Ch6](MLIR/compiler-view-of-MLIR/06-从AST到IR-OpBuilder与两类挂接.md) · [Ch7](MLIR/compiler-view-of-MLIR/07-Operation-create的完整路径与尾分配.md) · [Ch8](MLIR/compiler-view-of-MLIR/08-use-def链如何自动形成.md) | OpBuilder、Operation::create 与尾分配、use-def 链自动形成 |
-| IR 重写 | [Ch9](MLIR/compiler-view-of-MLIR/09-matchAndRewrite-图重写范式与全生命周期.md) · [Ch10](MLIR/compiler-view-of-MLIR/10-replaceOp-RAUW与erase-重写的原子动作.md) · [Ch11](MLIR/compiler-view-of-MLIR/11-驱动-工作表与监听者.md) | matchAndRewrite 图重写范式、RAUW/erase 原子动作、驱动/工作表/监听者 |
-| 专题与综合 | [Ch12](MLIR/compiler-view-of-MLIR/12-专题-type的parse-print往返.md) · [Ch13](MLIR/compiler-view-of-MLIR/13-综合-BufferCastOpFold闭环.md) | type 的 parse/print 往返、BufferCastOpFold 端到端闭环 |
+以编译器学科为镜头逐章拆解 MLIR 的工作机制——IR 如何被表示、构造、重写、销毁，共 **Ch0–Ch13**，分 7 部分：导论 → IR 逻辑结构 → def-use chain → IR 遍历 → IR 构建 → IR 重写 → 专题与综合。详细目录见 [compiler-view-of-MLIR/README.md](MLIR/compiler-view-of-MLIR/README.md)。
 
 ---
 

@@ -1,5 +1,7 @@
 # Introduction —— PyTorch Inductor 入门学习材料集
 
+> 返回：[← PyTorch 编译器技术栈总览](../README.md)
+>
 > 本目录包含从不同维度学习 PyTorch Inductor 的系统性教程。其中 **compiler_view_tutorial 是核心教程**，另外两套教程从管线阶段与类设计角度提供互补视角。
 
 ## 内容导航

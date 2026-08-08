@@ -1,5 +1,7 @@
 # MLIR Introduction——MLIR 编译器基础设施学习材料
 
+> 返回：[← PyTorch 编译器技术栈总览](../README.md)
+>
 > 本目录包含 MLIR 编译器基础设施的系统性学习资料。学习路线分为**两阶段**：先建立全景（编译器/IR 演进史、Dialect 体系、变换管线），再深入机制（以编译器学科为镜头逐层拆解 MLIR 的工作机制）。
 
 ## 学习路线总览
@@ -20,7 +22,7 @@
 
 ---
 
-## 第一阶段：[MLIR high level overview/](MLIR%20high%20level%20overview/)——MLIR 高层概述
+## ⭐ 第一阶段：[MLIR high level overview/](MLIR%20high%20level%20overview/)——MLIR 高层概述【核心推荐】
 
 源自 Lei.Chat 博客的系列文章，由 MLIR/SPIR-V 核心开发者撰写，从编译器与中间表示的演进历史出发，逐步深入到 MLIR 代码生成相关的核心 Dialect 体系和变换流程，共 **4 章**。
 
@@ -123,34 +125,7 @@
    Ch13 综合：BufferCastOpFold 闭环
 ```
 
-### 各章速览
-
-| 章 | 标题 | 编译原理切入 | 核心机制 |
-|---|---|---|---|
-| Ch0 | [MLIR 在编译器学科中的位置](compiler-view-of-MLIR/00-MLIR在编译器学科中的位置.md) | IR 表示三派（AST/三地址码/图IR）；可扩展 IR 哲学 | 五大基本概念、SSA 直觉 |
-| Ch1 | [MLIRContext：对象的所有权与唯一化](compiler-view-of-MLIR/01-MLIRContext-对象的所有权与唯一化.md) | 符号表/类型表传统；hash-consing | pImpl、StorageUniquer、dialect 加载 |
-| Ch2 | [Operation：一切皆操作及其部件语义](compiler-view-of-MLIR/02-Operation-一切皆操作及其部件语义.md) | IR 表示理论；一切皆操作 | Operation 部件语义、Operand vs Attribute 分野 |
-| Ch3 | [Block、Region 与控制流结构](compiler-view-of-MLIR/03-Block-Region与控制流结构.md) | CFG 与基本块；φ 节点 | Block argument 取代 φ、Region 结构化作用域 |
-| Ch4 | [def-use chain：从数据流分析到 use-list 实现](compiler-view-of-MLIR/04-def-use-chain-从数据流分析到use-list实现.md) | 数据流分析；def-use chain 物理实现 | use-list、`back` 指针、insertInto/removeFromCurrent |
-| Ch5 | [遍历 IR：walk、predecessor 与变更契约](compiler-view-of-MLIR/05-遍历IR-walk-predecessor与变更契约.md) | 数据流分析迭代算法 | walk、predecessor、变更契约 |
-| Ch6 | [从 AST 到 IR：OpBuilder 与两类挂接](compiler-view-of-MLIR/06-从AST到IR-OpBuilder与两类挂接.md) | 前端语义分析→IR 构造 | OpBuilder、两类挂接、OperationState |
-| Ch7 | [Operation::create 与尾分配](compiler-view-of-MLIR/07-Operation-create的完整路径与尾分配.md) | 声明式 IR 定义（.td→.inc） | 三段式构建管线、尾分配内存模型 |
-| Ch8 | [use-def 链如何自动形成](compiler-view-of-MLIR/08-use-def链如何自动形成.md) | SSA 不变量的自动维护 | OpOperand 构造即入链 |
-| Ch9 | [matchAndRewrite：图重写范式与全生命周期](compiler-view-of-MLIR/09-matchAndRewrite-图重写范式与全生命周期.md) | 项重写系统、图重写 | OpRewritePattern、两个继承家族 |
-| Ch10 | [replaceOp、RAUW 与 erase：重写的原子动作](compiler-view-of-MLIR/10-replaceOp-RAUW与erase-重写的原子动作.md) | SSA 不变量维护 | RAUW 三原子动作、erase 安全、DCE |
-| Ch11 | [驱动、工作表与监听者](compiler-view-of-MLIR/11-驱动-工作表与监听者.md) | 不动点与单调框架 | worklist、listener、终止性 |
-| Ch12 | [专题：type 的 parse/print 往返](compiler-view-of-MLIR/12-专题-type的parse-print往返.md) | 词法/语法/语义分析分层 | parse 作为反序列化器 |
-| Ch13 | [综合：BufferCastOpFold 闭环](compiler-view-of-MLIR/13-综合-BufferCastOpFold闭环.md) | 端到端优化 pass | walk→match→RAUW→erase 全链路 |
-
-> 详细的阅读路线、源码约定与原文素材对照见 [compiler-view-of-MLIR/README.md](compiler-view-of-MLIR/README.md)。
-
-### 第二阶段怎么读
-
-**第一遍（建立全景）**：顺序读 Ch0–Ch5。建立全书的元话语——MLIR 是什么、IR 长什么样、数据怎么流、怎么遍历。
-
-**第二遍（深入机制）**：按需读 Ch6–Ch11。这是 IR 的动态生命周期——构建、重写。如果你的兴趣是写 lowering pass，Ch6–Ch11 是核心。
-
-**第三遍（贯通）**：读 Ch12–Ch13。这两章是综合应用——Ch12 从前端序列化的视角回扣编译流水线，Ch13 把前十一章的机制串成一个真实的优化 pass。
+全书以 **IR 的完整生命周期**为骨架，分 7 部分（Ch0–Ch13）：导论 → IR 逻辑结构 → def-use chain → IR 遍历 → IR 构建 → IR 重写 → 专题与综合。详细章节目录与阅读方法见 [compiler-view-of-MLIR/README.md](compiler-view-of-MLIR/README.md)。
 
 ---
 

@@ -1,5 +1,7 @@
 # ATen 基础算子讲解书（给 inductor 开发者的培训教材）
 
+> 返回：[← PyTorch 编译器技术栈总览](../README.md)
+>
 > 这是一本面向**参与 torch-inductor（含 torch-npu `_inductor_new` 后端）开发人员**的基础算子功能手册。目标只有一个：**系统性、全面地理解 PyTorch 基础算子到底在做什么**——尤其是那些"看不出在干什么、为什么需要它"的**操作类算子**。
 >
 > 本书**不讲算子开发**（不教你写新算子），只讲**算子功能**：数学公式 / 操作逻辑 / 实现复杂度 / 在模型里的角色。
@@ -261,3 +263,13 @@ Inductor 视角（一行）　pointwise/reduction/template/fallback + 为什么
 ---
 
 *本书验证基准：torch 2.7.1 + torch-npu 2.7.1.post4。算子归类（core-aten）以 `torchgen/.../native_functions.yaml` 的 `core` 标签为准；inductor 降级以 `torch/_inductor/lowering.py` 为准。*
+
+---
+
+## 与编译器教程的关系
+
+本书是三大编译器教程的**算子前置知识**——Inductor 的输入就是一张由 `aten.*` 算子组成的计算图，理解每个算子在做什么是理解 Inductor 如何 lower 它们的前提。
+
+- **[Inductor 编译器教程](../Inductor%20Introduction/)** — 书中每个算子的「Inductor 视角」标注（pointwise / reduction / template / fallback）直接对应 Inductor 的 lowering 路径
+- **[Triton 编译器教程](../Triton%20Introduction/)** — Inductor 默认生成 Triton kernel；算子类型决定了走哪条 codegen 路径
+- **[MLIR 编译器基础设施教程](../MLIR/)** — Triton 本身基于 MLIR 构建，底层 IR 理解有助于建立完整技术栈视图

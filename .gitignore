@@ -1,3 +1,7 @@
 .DS_Store
 code/trace
 code/src/torch_compile_debug
+
+# Obsidian 自动生成的默认 vault 内容（无书稿）
+pytorch inductor book/
+.obsidian

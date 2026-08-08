@@ -1,6 +1,8 @@
 # PyTorch Inductor：从编译器设计视角的系统性分析
 
 > *An Architect's Guide to PyTorch Inductor — A Compiler Design Perspective*
+>
+> 返回：[← Inductor 教程导航](../README.md)
 
 ## 关于本书
 
@@ -44,6 +46,7 @@
 
 - [第 6 章：依赖分析与调度前置](ch06_dependency.md)
 - [第 7 章：融合策略与循环优化](ch07_fusion.md)
+  - 📖 延伸专题：[Inductor Tiling 系统：从数学本质到代码生成](tiling-teaching.md)（第 7 章 tiling 深度专题，从迭代域的数学结构到 Inductor 数据结构再到代码生成全链路）
 - [第 8 章：指令选择与代码生成](ch08_codegen.md)
 - [第 9 章：内存管理与缓冲区分配](ch09_memory.md)
 - [第 10 章：指令调度](ch10_instruction_scheduling.md)
