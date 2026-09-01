@@ -1,5 +1,7 @@
 # 《vLLM 中的 Inductor》— 面向 Inductor 开发者的 vLLM 编译栈全景教材
 
+> 返回：[← PyTorch 编译器技术栈总览](../README.md)
+>
 > **读者契约**:假设你懂 dynamo / AOTAutograd / Inductor 流水线、做过简单的 Inductor 开发;**不假设任何 vLLM 知识**(第 2 章兜底)。
 > **事实基准**:vLLM **0.27.1** 源码(`venv_vllm/lib/python3.11/site-packages/vllm/`);官方文档仅作叙事背景,凡不一致处以源码为准。
 

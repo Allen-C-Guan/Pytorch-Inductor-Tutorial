@@ -1,10 +1,11 @@
-# PyTorch 编译器技术栈（inductor / operator / triton / MLIR）（持续补充中）
+# PyTorch 编译器技术栈（inductor / vllm / operator / triton / MLIR）（持续补充中）
 
-系统性的 PyTorch 编译器技术栈源码教学材料，按 **Inductor → operator → Triton → MLIR** 的顺序组织四大核心：**Inductor 编译器**、**基础算子（ATen Ops）**、**Triton 编译器** 与 **MLIR 编译器基础设施**，面向准备从事 ML 编译器开发的工程师，以专家视角提供从全局架构到关键代码的完整学习路径。
+系统性的 PyTorch 编译器技术栈源码教学材料，按 **Inductor → vLLM 实战 → operator → Triton → MLIR** 的顺序组织五大核心：**Inductor 编译器**、**vLLM 工业级编译集成**、**基础算子（ATen Ops）**、**Triton 编译器** 与 **MLIR 编译器基础设施**，面向准备从事 ML 编译器开发的工程师，以专家视角提供从全局架构到关键代码的完整学习路径。
 
 ## 教学目标
 
 - **Inductor**：理解 PyTorch 2 编译管线的完整架构——Dynamo 追踪 → FX 图优化 → Lowering → 调度与融合 → 代码生成
+- **vLLM 实战**：理解 `torch.compile` 在工业级推理服务中的完整落地——vLLM 如何把编译当轴线重排运行时、算子边界与缓存策略（一次捕获、丢 guards、Piecewise 切分、CUDA Graph、compile-once），看编译原理落进工程现场的第一手样本
 - **operator（基础算子）**：理解被 Inductor 编译的对象——ATen 基础算子到底在做什么（数学语义 / 操作逻辑 / 在模型里的角色），尤其是难懂的「操作类算子」（as_strided / gather / scatter …），以及每个算子在 Inductor 中走哪条降级路径（pointwise / reduction / template / fallback）
 - **Triton**：理解 Triton 编译器的全栈设计——从 DSL 前端（TTIR）到 GPU 后端（TTGIR → LLVM IR → PTX → CUBIN）
 - **MLIR**：理解 MLIR 编译器基础设施的设计哲学——先从全局俯瞰（编译器/IR 演进史、Dialect 体系、渐进式递降），再以编译器学科视角逐层拆解其工作机制（IR 表示、def-use chain、重写范式）
@@ -17,6 +18,7 @@
 - MLIR 论文 (CGO 2021): *"MLIR: Scaling Compiler Infrastructure for Domain Specific Computation"*
 - MLIR Dialect 教程 (Lei.Chat): 由 MLIR/SPIR-V 核心开发者撰写的系列博客，涵盖 Linalg/Vector Dialect 与变换管线
 - TorchInductor 设计帖: [dev-discuss.pytorch.org](https://dev-discuss.pytorch.org/t/torchinductor-a-pytorch-native-compiler-with-define-by-run-ir-and-symbolic-shapes/747)
+- vLLM torch.compile 设计文档: [docs.vllm.ai — torch.compile](https://docs.vllm.ai/en/latest/design/torch_compile/)（《vLLM 中的 Inductor》的事实基准为 vLLM 0.27.1 源码）
 - 编译器理论教材: *Engineering a Compiler* (Keith D. Cooper & Linda Torczon, 3rd Edition)
 
 ---
@@ -32,6 +34,11 @@ my pytorch tutorial/
 │   ├── compiler_view_tutorial/          # ⭐【核心】编译器设计视角（12章 + 2附录）
 │   ├── skeleton_tutorial/               # 管线阶段视角（5个 phase）
 │   └── key_classes_analysis/            # OOP/类设计视角（9章 + 附录）
+│
+├── inductor in vllm book/               # ⭐【核心】vLLM 中的 Inductor：工业级编译集成实战（已定稿）
+│   ├── README.md                        # 该书导航（15章 + 前言 + 附录 A/B/C）
+│   ├── 00-前言 ~ 15-动手实践            # 全景 → 配置/前端 → 中端切分 → 后端编译 → 产物/运行时 → 哲学/实践
+│   └── appendix-A/B/C                   # 术语对照、图例与写作规范、源码锚点索引
 │
 ├── operator/                            # 基础算子（ATen Ops）教程：以 Inductor/编译器视角看算子
 │   ├── README.md                        # ⭐【核心】算子书导航（含 161 算子速查）
@@ -58,7 +65,7 @@ my pytorch tutorial/
 
 ---
 
-## 四大教程体系
+## 五大教程体系
 
 ### Inductor 编译器教程 → [Inductor Introduction/](Inductor%20Introduction/)
 
@@ -69,6 +76,25 @@ my pytorch tutorial/
 | **compiler_view_tutorial**（核心） | 编译器理论，映射 EaC 教材 | 12章 + 2附录 | 建立整体认知框架 |
 | **skeleton_tutorial** | 编译管线阶段，12节标准化模板 | 5个 phase | 快速了解各阶段边界与数据流 |
 | **key_classes_analysis** | OOP/类设计，类继承树与协作关系 | 9章 + 附录 | 深入源码理解"为什么这样设计" |
+
+### vLLM 中的 Inductor → [inductor in vllm book/](inductor%20in%20vllm%20book/)
+
+> **定位**：**Inductor 教程的直接工业后续**——学完编译管线后，立刻看它被放进真实推理服务的样子：一个工业级系统为了吃下编译收益，愿意把多少东西重塑给编译器让路（重排运行时、算子边界与缓存策略）。
+
+面向 Inductor 开发者的 vLLM 编译栈全景教材，**15 章 + 前言 + 附录 A/B/C 已全部定稿**。以 vLLM **0.27.1** 源码为唯一事实基准，沿五层编译栈（模型层 → Dynamo 前端 → vLLM 中端 → Inductor 后端 → 运行时执行层）逐层拆解 `torch.compile` 的工业级集成。全书共享一条叙事因果链：**decode 是 CPU/launch bound → 必须消灭 Python 开销 → 代价是编译 → 编译的代价是启动时间 → 所以全部编译前置 + 缓存 → 所以敢丢 guards、敢一次 trace、敢去泛函化**。
+
+**读者契约**：假设你懂 dynamo / AOTAutograd / Inductor 流水线（即已完成 [Inductor Introduction](Inductor%20Introduction/)），**不假设任何 vLLM 知识**（第 2 章兜底）。
+
+**详细目录见 [inductor in vllm book/README.md](inductor%20in%20vllm%20book/README.md)**
+
+| 部分 | 章节 | 核心内容 |
+|------|------|---------|
+| Part I 背景与全景 | 第 1~3 章 | launch-bound 的 decode、V1 引擎最小背景、编译栈五层全景图 |
+| Part II 配置与前端 | 第 4~5 章 | CompilationMode / CUDAGraphMode / -O 优化级别、@support_torch_compile 与「一次捕获」哲学 |
+| Part III 中端切分 | 第 6~7 章 | Piecewise 切分（attention 为何是图的边界）、unified_attention / vllm_ir 与 activation donation |
+| Part IV 后端编译 | 第 8~10 章 | VllmBackend 总编排、逐 range 编译与 Inductor 对接、PostGradPassManager 与自定义 fusion |
+| Part V 产物与运行时 | 第 11~13 章 | execution_fn / liveness / 可序列化产物、CUDA Graph capture/replay 与运行时分派、编译缓存与 AOT |
+| Part VI 哲学与实践 | 第 14~15 章 | 七条设计命题 P1~P7、动手实践与调试 |
 
 ### operator 基础算子教程 → [operator/](operator/)
 
@@ -128,7 +154,7 @@ MLIR 教程采用**两阶段**结构，先建立全景再深入机制：
 | 前端 | [第 3 章](Inductor%20Introduction/compiler_view_tutorial/ch03_ir_design.md) | Inductor IR 设计 |
 | 中间层 | [第 4 章](Inductor%20Introduction/compiler_view_tutorial/ch04_lowering.md) · [第 5 章](Inductor%20Introduction/compiler_view_tutorial/ch05_optimization.md) | Lowering、图优化 |
 | 后端 | [第 6 章](Inductor%20Introduction/compiler_view_tutorial/ch06_dependency.md) · [第 7 章](Inductor%20Introduction/compiler_view_tutorial/ch07_fusion.md) · [第 8 章](Inductor%20Introduction/compiler_view_tutorial/ch08_codegen.md) · [第 9 章](Inductor%20Introduction/compiler_view_tutorial/ch09_memory.md) · [第 10 章](Inductor%20Introduction/compiler_view_tutorial/ch10_instruction_scheduling.md) | 依赖分析、融合、代码生成、内存管理、指令调度 |
-| 集成与展望 | [第 11 章](Inductor%20Introduction/compiler_view_tutorial/ch11_e2e_compilation.md) · [第 12 章](Inductor%20Introduction/compiler_view_tutorial/ch12_ecosystem.md) | 端到端流程回顾、PyTorch 生态协同 |
+| 集成与展望 | [第 11 章](Inductor%20Introduction/compiler_view_tutorial/ch11_e2e_compilation.md) · [第 12 章](Inductor%20Introduction/compiler_view_tutorial/ch12_pytorch_ecosystem.md) | 端到端流程回顾、PyTorch 生态协同 |
 
 #### 第三阶段：核心类设计
 
@@ -147,6 +173,16 @@ MLIR 教程采用**两阶段**结构，先建立全景再深入机制：
 | [第 7 章](Inductor%20Introduction/key_classes_analysis/chapter07_kernel_codegen.md) | Kernel 代码生成 |
 | [第 8 章](Inductor%20Introduction/key_classes_analysis/chapter08_wrapper_codegen.md) | Wrapper 代码生成 |
 | [第 9 章](Inductor%20Introduction/key_classes_analysis/chapter09_end_to_end.md) | 端到端流程串联 |
+
+### vLLM 中的 Inductor 学习路线（Inductor 教程的工业实战后续）
+
+前置：已熟悉 dynamo / AOTAutograd / Inductor 流水线（完成 [Inductor Introduction](Inductor%20Introduction/) 任一教程即可）；**不假设任何 vLLM 知识**。
+
+1. **速览（约 2 小时，建立心智模型）**：第 1 → 3 → 14 章 —— 动机（decode 为何 CPU/launch bound）、五层全景图、七条设计命题
+2. **主线（教材式）**：第 1~15 章顺序读，这是本书设计的默认路径，每章末尾有下一章预告
+3. **深潜（要改代码的读者）**：第 3 章站稳后按 Part III → IV → V 逐层下钻，边读边对照章末源码索引开源码，最后用第 15 章的调试工具亲手验证机制
+
+详细目录与阅读路径见 [inductor in vllm book/README.md](inductor%20in%20vllm%20book/README.md)。
 
 ### operator 基础算子学习路线
 
@@ -190,7 +226,7 @@ MLIR 学习分两阶段推进：**先建立全景，再深入机制**。
 
 三大编译器教程（Inductor / Triton / MLIR）均以 *Engineering a Compiler* (3rd Edition) 为理论骨架，以下是关键映射。
 
-> **operator 教程不在此列**：它不是以 EaC 为骨架的编译器教材，而是以「算子分类轴」（位置保持 vs 位置变化）组织的**算子功能手册**，定位为三大编译器教程的算子前置知识——EaC 阶段表里的任何一行，落到 Inductor 源码里的具体处理对象，都可在 [operator/](operator/) 找到对应算子的功能与降级路径讲解。
+> **operator 教程与《vLLM 中的 Inductor》不在此列**：前者不是以 EaC 为骨架的编译器教材，而是以「算子分类轴」（位置保持 vs 位置变化）组织的**算子功能手册**，定位为三大编译器教程的算子前置知识——EaC 阶段表里的任何一行，落到 Inductor 源码里的具体处理对象，都可在 [operator/](operator/) 找到对应算子的功能与降级路径讲解；后者以 vLLM 编译栈五层架构为主线，是 EaC 各阶段在工业推理服务里的**落地检验场**——每个环节都带着生产级约束与取舍（如图优化遇上 compile-once 缓存、指令调度遇上 CUDA Graph），详见 [inductor in vllm book/](inductor%20in%20vllm%20book/)。
 
 | EaC 章节 | 主题 | Inductor 对应模块 | Triton 对应模块 | MLIR 对应内容 |
 |----------|------|------------------|----------------|-------------|
