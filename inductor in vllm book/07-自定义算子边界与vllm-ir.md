@@ -2,7 +2,7 @@
 chapter: 7
 part: III
 title: 自定义算子边界:unified_attention、vllm_ir 与 activation donation
-status: done
+status: review
 difficulty: ★★★★
 depends: [2, 3, 5, 6]
 ---
@@ -25,6 +25,29 @@ VI  收官:   [14 设计哲学] → [15 动手实践]
 回顾全书的叙事主线:decode 是 CPU/launch bound → 必须消灭 Python 开销 → 代价是编译 → 编译代价是启动时间 → 所以全部编译前置并缓存(详见第 1 章)。本章的每一个机制都长在这条因果链上:直注册算子省掉的是每次调用的一层 dispatch、把 reshape 挪出算子省掉的是图外区的 Python 张量操作、删掉防御性拷贝省掉的是每次前向的显存带宽。单看每一处都只是微秒级的小钱,但 decode 每秒要跑几十步、每步几十层,小钱乘以频率就是可观测的时延。
 
 值得先建立一个直觉:墙与桥不是两种技术,而是同一枚硬币的两面。墙说"这里编译器不必懂",桥说"这里编译器必须懂"。一个健康的编译栈两者都需要——全是墙则融合无从谈起,全是桥则编译器要理解整个世界。vLLM 的算子设计,本质上就是在逐个算子地回答"这道边界应该画在哪里"。
+
+先把本章放进整条编译管线:
+
+```text
+torch.compile(model)
+│
+├─ dynamo 一次捕获(自定义算子随图入册)──▶ 整图 FX
+│
+├─ 切分 ─▶ submod_0..N
+│
+├─ 全量预编译(片段 × range)
+│    └─ compile_fx
+│         ├─ AOTAutograd ◄== 本章上半场:墙与桥在此受考验
+│         │    ├─ 泛函化:mutating op → auto_functionalized
+│         │    └─ IrOp 拒收 ATen 分解 → 整块语义活过 AOT
+│         ├─ pass 流水线 ◄== 本章下半场
+│         │    ├─ VllmIRLowering:整块 IrOp 在使用处内联展开
+│         │    └─ UnsafeCloneElimination:donation 删防御性拷贝
+│         └─ Inductor
+│
+├─ 造外壳
+└─ serve 期:查 range 执行
+```
 
 ## 7.1 最小前置知识
 
@@ -54,7 +77,7 @@ attention 是 LLM 推理中最不适合被编译器理解的算子。它读写�
 
 > **上游给我**:L1 模型层的 `Attention.forward`(`vllm/model_executor/layers/attention/attention.py:488`,输入:QKV projection 产出的 query/key/value 张量)→ **我做**:分配输出缓冲、整理输入、调用统一的注意力算子 → **产出**:dynamo FX 图中的一个 `call_function` 节点,流向 L3 的 `split_graph`(`vllm/compilation/backends.py:1179`)成为切分锚点(详见第 6 章)。
 
-这个算子名为 **`unified_attention_with_output`(统一注意力算子)**,它的注册只有六行(`attention.py:862-867`),却浓缩了六个环环相扣的设计决定:
+这个算子名为 **`unified_attention_with_output`(统一注意力算子)**,它的注册只有六行(`attention.py:862-867`),却浓缩了六个环环相扣的设计决定。要看懂它们共同服务的东西,先回顾一个两难:第 5 章拍板整模型一次 trace、一条路径打天下,attention 因此**必须在图里**;而 7.2 刚说明它又是全模型**最不可编译**的算子。两难的唯一出路,是造一个容器把 attention 整个装进去——对外(编译世界)它伪装成乖巧的普通算子:"我吃这些张量、写那个张量,形状都在 schema 里";对内(运行世界)它保留全部自由:"实现是哪家 kernel、元数据是什么,编译器管不着"。**六个设计,就是这份入住合同的六条条款——每一条都在解决"attention 想住进编译世界必须满足的一个条件";它不是六个功能,是六道逐条的过关手续。**打个比方,这个容器是一只集装箱:货物(各家 attention kernel、变长元数据、KV cache 副作用)奇形怪状,货船与吊车(Inductor、CUDA Graph、dynamo)只认标准箱体,六个设计就是把货物装进箱子的六条 packing rules。看得再高一层,这六条不是并列的,而是三对各管一摊:**b 与 f 造墙**(编译器看见什么、看不见什么),**a 与 e 驯服副作用**(诚实声明谁被写、把副作用顺序翻译成数据流),**c 与 d 清零过路费**(不多付一次 dispatch、不多包一层 Python)。后文六段,全是这三对条款的逐条展开:
 
 **a. 输出由调用方分配后传入。** `output = torch.empty(...)` 在 `Attention.forward` 里分配(`attention.py:531`),再作为参数传进 op(`:554` 直接函数调用,或 `:574` 经 `torch.ops.vllm.*`);注册时声明 `mutates_args=["output", "output_block_scale"]`(`:865`)。收益有三层:图内零分配(Inductor 不必为它做内存规划)、schema 如实声明副作用(functionalization 有据可依)、CUDA Graph 的静态 buffer 语义天然满足——输出地址每次都一样,capture/replay(详见第 12 章)直接可用。
 
@@ -100,37 +123,49 @@ def unified_kv_cache_update(key, value, layer_name) -> torch.Tensor:
 
 **f. 运行时从 ForwardContext 取动态信息。** 真实实现(`attention.py:817-846`)顶着两个装饰器:`@eager_break_during_capture`(配合可断捕获的 CUDA Graph 模式,让本 op 在捕获期成为 eager 断点)与 `@maybe_transfer_kv_layer`(PD 分离部署下按需传输 KV)。函数体内先经 `get_attention_context(layer_name)`(`:732`)从 `ForwardContext` 解出 attn_metadata、层实例与 KV cache 张量,再调 `impl.forward(..., output=output)`(`:836-846`)。图是静态的,信息是动态的——层名是图内常量,内容每步经 `ForwardContext` 的模块级全局状态送达。
 
+六条条款至此集齐。三对分工,缺哪一对都有具体的坏法:缺造墙的一对,墙会漏(trace 进实现即 guards 爆炸、元数据进图即每步重编译);缺驯服副作用的一对,墙会错(replay 读写悬空指针、KV 重排后静默读到旧值);缺清零过路费的一对,墙会贵(每次调用多付一层 Python 税)。三对合起来,才是完整的"墙"——墙不是一刀切完就完:墙上的门(输入输出张量)、门的规格(schema)、墙内墙外的通信(ForwardContext)、货物的摆放(外部分配/外提 reshape),每一处都要重新设计一遍。最后把这颗算子的完整生命线串起来:
+
+```text
+【示意图】unified_attention_with_output 的完整生命线
+模型代码一行调用 (attention.py:554)
+   → FX 图里一个 call_function 节点 (dynamo 零窥视,b)
+   → 第 6 章切分锚:命中 splitting_ops 名单,自成一区 (splitting piece,不进 Inductor)
+   → 两侧的可编译 piece 各自走 Inductor;它自己以源码执行
+   → 运行时:节点携带层名常量 → get_attention_context 从 ForwardContext
+     解出当步的 attn_metadata/KV cache → 调真实后端 kernel (f)
+   → KV 写节点经 new_empty(0) 接力棒锁死在它前面 (e)
+```
+
+一句话收束:`unified_attention_with_output` 的用途,是把"全模型最不可编译的算子"合法地装进"一次捕获的编译世界"——六个设计不是六个功能,而是这份入住合同的六条条款:两条造墙、两条驯服副作用、两条清零过路费;缺任何一条,墙要么漏(重编译/重排错误),要么贵(多付 Python 税)。
+
 ### 7.3.2 桥:vllm_ir 与 IrOp
 
 > **上游给我**:L1 模型层用 `@register_op(allow_inplace=True)` 装饰的 native 实现(如 `vllm/ir/ops/layernorm.py:43` 的 `fused_add_rms_norm`;同文件 `:9` 的 `rms_norm` 未开 allow_inplace)→ **我做**:推断 schema、注册 torch 算子、登记多实现 → **产出**:`IrOp` 对象与 `torch.ops.vllm_ir.*` 算子(`vllm/ir/op.py:219`、`:521`),供模型层调用、供编译 pass 识别与替换。
 
-**`IrOp`(IR 算子)** 是这条桥的桥墩(`vllm/ir/op.py:155`)。注册流程(`register_op`,`:106`)做了四件关键的事:用 `infer_schema` 从 native 函数签名推 schema(`:198`);`lib.define` 进 `vllm_ir_torch_lib = Library("vllm_ir", "FRAGMENT")`(`:21`、`:219`);以 `CompositeExplicitAutograd` dispatch key 注册实现(`:222`)——源码注释点明要害:"CompositeExplicitAutograd is not decomposed by ATen IR normalization in AOTAutograd",即**故意不被 ATen 归一化分解**,在 FX 图中保持为整块节点;最后 `_register_fake`(`:223`)并解析出 `torch_op`(`:226`)。对比墙:墙是"没有分解可谈",桥是"有分解而拒收"——拒收是为了把融合决策权留在 vLLM 自己的 pass 手里(第 10 章)。
+先把合同摆上桌,与 7.3.1 对照着读:**墙的合同,是把"最不可编译的算子"装进编译世界,代价是永远得不到融合;桥的合同,是把"最适合融合的算子"以"整块、可替换、可插拔"的形态送进编译世界,让手写 kernel 的质量与编译器融合的能力在同一张图里会师。**墙的这份代价恰恰落在最疼的地方:第 1 章 1.3.4 实测表里 AllReduce+RMSNorm 最高 +15%、SiLU+Quant 最高 +8% 的收益,全部来自小算子与邻居的融合——rms_norm 若也做成墙,两侧融合区被拦腰切断,等于白白扔掉第 10 章的存在意义。而它不必做成墙的理由,7.2 已给出业务判断:rms_norm 内部存在跨实现的公共模式(归一化、残差加减、量化,全是可首尾相接的规则算术),该让编译器接手。打个比方:墙是整箱吊走、永不拆箱的集装箱;`vllm_ir` 算子是带标准榫头的预制板——整块进场、后期替换、边缘能与两侧现浇部分浇筑成一体,"融合"之名即由此而来。
+
+**`IrOp`(IR 算子)** 是这条桥的桥墩(`vllm/ir/op.py:155`)。注册流程 `register_op` 做了四件关键的事:用 `infer_schema` 从 native 函数签名推 schema;`lib.define` 进 `vllm_ir_torch_lib = Library("vllm_ir", "FRAGMENT")`;以 `CompositeExplicitAutograd` dispatch key 注册实现——源码注释点明要害:"CompositeExplicitAutograd is not decomposed by ATen IR normalization in AOTAutograd",即**故意不被 ATen 归一化分解**,在 FX 图中保持为整块节点;最后 `_register_fake` 并解析出 `torch_op`。对比墙:墙是"没有分解可谈",桥是"有分解而拒收"——拒收是为了把融合决策权留在 vLLM 自己的 pass 手里(第 10 章)。
 
 IrOp 还有几处为推理场景量身定制的机关:
 
-- **激活按参数名约定识别**。以 "x" 开头的参数默认视为激活(`:179-185`),据此算出 `activation_indices`(`:192`)——donation 机制全靠这份清单。
-- **provider 优先级 dispatch**。**`provider`(实现提供者)** 是同一算子的一种实现(native 永远存在,平台可再注册 Triton/厂商实现)。`dispatch(*args)`(`:327`)按 `_priority_impls` 顺序做 `supports_args` 检查后返回选中的 `IrOpImpl`,函数 docstring 直接标注 "THIS FUNCTION IS ON THE HOT PATH"。优先级由 `set_default`(进程级,worker 启动期)/`set_priority`(作用域上下文管理器)(`:415`/`:429`)设定——命题 P6「平台与后端可插拔」在这里落成两行代码。
-- **maybe_inplace overload**。**`IrOpInplace`(可就地 IR 算子)**(`:481`)在注册时额外生成一个 **`maybe_inplace`(或就地 overload)**:它用与 default 完全相同的签名,只是 schema 里 `mutates_args=op.activations`(`:515-517`),并直接调 `impl.impl_fn` 而非 `func_impl_fn`——不走 clone(`:536-539`)。语义约定:调用方用 maybe_inplace 就是在向编译器声明"这些激活我不要了"。
-- **IrOpImpl 与函数语义保险**。**`IrOpImpl`(IR 算子实现)**(`:542`)记录 provider、是否 inplace;其 `func_impl_fn`(`:650`)在以函数式(default)方式调用一个 inplace 实现时,先把激活 clone 一份再交给实现——用一次拷贝恢复函数语义。它的 `uuid`(`:638`)把实现源文件内容哈希进缓存键,由 lowering pass 统一汇入(见下),实现源码一改缓存自动失效(命题 P1)。
-- **eager 快捷通道**。`_ENABLE_TORCH_WRAP`(`:50`)关闭时,`IrOp.__call__`(`:368`)绕过 torch dispatch 直调 `_inner_call`——给不用 Inductor 的平台省掉 eager 模式的 dispatch 开销。
+- **激活按参数名约定识别**。以 "x" 开头的参数默认视为激活,据此算出 `activation_indices`——donation 机制全靠这份清单。
+- **provider 优先级 dispatch**。**`provider`(实现提供者)** 是同一算子的一种实现(native 永远存在,平台可再注册 Triton/厂商实现)。`dispatch(*args)`(`vllm/ir/op.py:327`)按 `_priority_impls` 顺序做 `supports_args` 检查后返回选中的 `IrOpImpl`,函数 docstring 直接标注 "THIS FUNCTION IS ON THE HOT PATH"。优先级由 `set_default`(进程级,worker 启动期)与 `set_priority`(作用域上下文管理器)设定——命题 P6「平台与后端可插拔」在这里落成两行代码。
+- **maybe_inplace overload**。**`IrOpInplace`(可就地 IR 算子)** 在注册时额外生成一个 **`maybe_inplace`(或就地 overload)**:它用与 default 完全相同的签名,只是 schema 里 `mutates_args=op.activations`,并直接调 `impl.impl_fn` 而非 `func_impl_fn`——不走 clone。语义约定:调用方用 maybe_inplace 就是在向编译器声明"这些激活我不要了"。
+- **IrOpImpl 与函数语义保险**。**`IrOpImpl`(IR 算子实现)** 记录 provider、是否 inplace;其 `func_impl_fn` 在以函数式(default)方式调用一个 inplace 实现时,先把激活 clone 一份再交给实现——用一次拷贝恢复函数语义。它的 `uuid` 把实现源文件内容哈希进缓存键,由 lowering pass 统一汇入(见下),实现源码一改缓存自动失效(命题 P1)。
+- **eager 快捷通道**。`_ENABLE_TORCH_WRAP` 关闭时,`IrOp.__call__` 绕过 torch dispatch 直调 `_inner_call`——给不用 Inductor 的平台省掉 eager 模式的 dispatch 开销。
 
-模型侧的使用是平淡的一行:`RMSNorm.forward_native` 里 `ir.ops.fused_add_rms_norm.maybe_inplace(x, residual, weight, eps, variance_size_override)`(`vllm/model_executor/layers/layernorm.py:88`)。
+模型侧的使用是平淡的一行:`RMSNorm.forward_native` 里 `ir.ops.fused_add_rms_norm.maybe_inplace(x, residual, weight, eps, variance_size_override)`(`vllm/model_executor/layers/layernorm.py:88`)。maybe_inplace 这件机关的注册与直调,一段伪代码看全:
 
-```python
-# vllm/ir/op.py:514-539 (v0.27.1,节选)
-        self.name = f"{op.name}.maybe_inplace"
-        self._schema_str = infer_schema(
-            op.impls["native"].impl_fn, mutates_args=op.activations   # 声明激活可写
-        )
-        lib = vllm_ir_torch_lib
-        lib.define(self.name + self._schema_str)
-        lib.impl(self.name, self._inner_call, dispatch_key="CompositeExplicitAutograd")
-        # ...(fake 注册与 torch_ops 解析略)...
-
-    def _inner_call(self, *args, **kwargs) -> Any:
-        # Calling the maybe_inplace overload means we can use inplace impls directly.
-        impl = self.op.dispatch(*args, **kwargs)
-        return impl.impl_fn(*args, **kwargs)    # 直接用实现,不 clone
+```text
+【伪代码】maybe_inplace overload 的注册与直调(vllm/ir/op.py:514-539 之意)
+注册(与 default 同签名,schema 声明激活可写):
+  schema = infer_schema(native 实现签名, mutates_args = op.activations)
+  vllm_ir_torch_lib.define("op.maybe_inplace" + schema)
+  vllm_ir_torch_lib.impl(..., dispatch_key = "CompositeExplicitAutograd")
+  # fake 注册与 torch_ops 解析同 default,略
+直调 _inner_call(*args):
+  impl = op.dispatch(*args)        # 按 provider 优先级选实现
+  return impl.impl_fn(*args)       # 就地实现直接用,不 clone
 ```
 
 下图标出两类算子在类体系中的关系:左半是墙(`AttentionLayerBase` → `Attention` → 注册进 torch `Library` 的 opaque op),右半是桥(`CustomOp` 派生的模型层(如 `RMSNorm`)调用 `IrOp` 家族与多 provider 实现),二者共享同一个 torch 注册底座。
@@ -207,19 +242,19 @@ classDiagram
 
 donation 的流水线横跨 pre-grad 与 post-grad 两个钩子(钩子注入详见第 8 章六步流水线第②步 `configure_post_pass`,`vllm/compilation/backends.py:934`)。一个激活张量(以 `x` 为例)的完整旅程如下。
 
-**第一站:pre-grad 的 `VllmIRInplaceFunctionalizationPass`**(`vllm/compilation/passes/ir/inplace_functionalization.py:21`,挂载于 `backends.py:939` 的 `pre_grad_custom_pass` 键)。
+**第一站:pre-grad 的 `VllmIRInplaceFunctionalizationPass`**(`vllm/compilation/passes/ir/inplace_functionalization.py:21`,挂载点见第 8 章工序②)。
 
-> **上游给我**:dynamo 捕获的、含 `vllm_ir.*.maybe_inplace` 节点的 FX 图(运行于 AOTAutograd 之前)→ **我做**:对每个 maybe_inplace 节点(a)按节点顺序断言激活输入没有任何 later users(`:68-81`,违反即抛错并解释"激活已捐赠、内存可能被输出复用");(b)若激活是图输入,记入 `pass_context.donated_input_ids`(`:87`,容器定义于 `passes/inductor_pass.py:29-37`);(c)把 `node.target` 改写为 default overload(`:90`)→ **产出**:一张正确泛函化的图 + 一份 **`donated_input_ids`(已捐赠输入编号集)**,经 PassContext 跨阶段传递。
+> **上游给我**:dynamo 捕获的、含 `vllm_ir.*.maybe_inplace` 节点的 FX 图(运行于 AOTAutograd 之前)→ **我做**:对每个 maybe_inplace 节点做三件事——(a)按节点顺序断言激活输入没有任何 later users,违反即抛错并解释"激活已捐赠、内存可能被输出复用";(b)若激活是图输入,记入 `pass_context.donated_input_ids`;(c)把 `node.target` 改写为 default overload → **产出**:一张正确泛函化的图 + 一份 **`donated_input_ids`(已捐赠输入编号集)**,经 PassContext 跨阶段传递。
 
 **第二站:AOTAutograd**(torch 侧)。图此刻已是纯函数形态(maybe_inplace 已改写为 default),AOTAutograd 照常做泛函化与微分拆分——vLLM 不碰它的内部。
 
 **第三站:post-grad 的 `VllmIRLoweringPass`**(`vllm/compilation/passes/ir/lowering_pass.py:25`)。
 
-> **上游给我**:泛函化的 post-grad FX 图(仍含整块 `vllm_ir` 节点)→ **我做**:注册覆盖全部 IR op 的 `CallFunctionVarArgs` 图模式(`:38-41`);`lower_matched_op`(`:43`)按 fake 参数调 `ir_op.dispatch` 选实现并记录 `selected_impls`(`:54-55`),再 `replace_by_example(ir_op_impl.func_impl_fn, ..., run_functional_passes=False)` 内联实现(`:67-69`)→ **产出**:只剩具体实现的图。若选中的是 inplace 实现,`func_impl_fn` 会 trace 出"先 clone 激活、再就地写 clone"的防御性代码——这正是下一站要删的对象。`uuid`(`:115`)把全部 IR op 的优先级与实现源码哈希并入 Inductor 缓存键。
+> **上游给我**:泛函化的 post-grad FX 图(仍含整块 `vllm_ir` 节点)→ **我做**:注册覆盖全部 IR op 的 `CallFunctionVarArgs` 图模式;按 fake 参数调 `ir_op.dispatch` 选实现并记录 `selected_impls`,再 `replace_by_example(ir_op_impl.func_impl_fn, ..., run_functional_passes=False)` 内联实现 → **产出**:只剩具体实现的图。若选中的是 inplace 实现,`func_impl_fn` 会 trace 出"先 clone 激活、再就地写 clone"的防御性代码——这正是下一站要删的对象;`uuid` 把全部 IR op 的优先级与实现源码哈希并入 Inductor 缓存键。
 
 **第四站:`UnsafeCloneEliminationPass`**(`vllm/compilation/passes/ir/clone_elimination.py:72`)。
 
-> **上游给我**:lowering 后的图 + `donated_input_ids` → **我做**:遍历幸存的 `aten.clone.default` 节点,依次过三道守卫——clone 必须保持 layout(`clone_preserves_layout`,`:19-36`);对 clone 的写入做 schema `is_write` 单写分析(`user_writes_to_node`,`:39-69`,恰好一次写);"原值在 mutation 之后不再被使用"(`:120-133`),且原值若是图输入则必须在捐赠名单里(`:136-144`)→ **产出**:删除冗余 clone、就地实现直写捐赠缓冲的图,流向 `FixFunctionalizationPass` 收尾(`pass_manager.py:123-138`:post_cleanup → ir_lowering → clone_elimination → post_cleanup → fix_functionalization)。
+> **上游给我**:lowering 后的图 + `donated_input_ids` → **我做**:遍历幸存的 `aten.clone.default` 节点,依次过三道守卫——clone 必须保持 layout;对 clone 的写入做 schema `is_write` 单写分析(恰好一次写);"原值在 mutation 之后不再被使用",且原值若是图输入则必须在捐赠名单里 → **产出**:删除冗余 clone、就地实现直写捐赠缓冲的图,流向 `FixFunctionalizationPass` 按 post_cleanup → ir_lowering → clone_elimination → post_cleanup → fix_functionalization 的固定序收尾。
 
 "unsafe"之名是诚实的:docstring(`:74-81`)写明该 pass **不做别名分析**,只为已知 vLLM 图形态保证正确,不承诺一般图上的可靠性——这是 vLLM 用边界清晰的不变量(图形态受控、provider 行为受控)换取激进取舍的又一例(命题 P2)。以 `fused_add_rms_norm(x, residual, weight, eps)` 为例,前后对照如下(示意图,非真实 dump):
 
@@ -261,11 +296,20 @@ flowchart LR
   J -.-> K([serve 期 replay<br/>零拷贝零 Python 编排]):::ext
 ```
 
-### 7.3.4 与上游的边界:env_override 的补丁与 FALLBACK_ALLOW_LIST
+### 7.3.4 与上游的边界:env_override 的红补丁与 FALLBACK_ALLOW_LIST
 
-vLLM 与 PyTorch 的边界不只画在算子上,还画在运行时补丁上。`import vllm` 的第一刻(`vllm/__init__.py:14`)就会执行 `vllm/env_override.py`:它设置若干环境变量,并对 Inductor/dynamo 内部打一组版本受控的 monkey-patch——`memory_plan_reuse`(`:130`)、`get_graph_partition_signature`(`:198`)、`Scheduler.should_partition`(`:360`,专为 `unified_attention_with_output` 这类带 in-place mutation 的 splitting op 绕开 Inductor 的 `origin_node` 断言)、`get_raw_stream`(`:468`)、`GraphCaptureOutput.get_runtime_env`(`:582`)、`FxGraphCachePickler.dumps`(`:606`)等,每处都注明对应的上游 PR 与"升至某版本后可移除"。
+> **上游给我**:import vllm 的第一刻(进程初始化)→ **我做**:`vllm/env_override.py` 设置若干环境变量,并对 Inductor/dynamo 内部打一组版本受控的 monkey-patch → **产出**:一个对 vLLM 用法"恰好可用"的上游运行时,补丁随 import 常驻整个进程。
 
-与本章最相关的是 **`FALLBACK_ALLOW_LIST`(fallback 白名单)** 的 fast-path 补丁(`:793-858`):当 Inductor 遇到没有注册 lowering 的自定义算子(如 `vllm::all_reduce`)时,若其 base_name 不在白名单里,`GraphLowering.call_function` 会走慢路径并对整个输入 IR 树做代价高昂的字符串化日志——对深层 TP/MoE 图这能吃掉数分钟编译时间。补丁用一层代理对象(`:796`)让所有 `vllm::`、`vllm_aiter::` 前缀的算子在 `__contains__` 里恒真(`:804-807`),把它们全部送上 fast-path,而其余成员判断与迭代照旧委托原集合(`:815-825`)。
+vLLM 与 PyTorch 的边界不只画在算子上,还画在运行时补丁上。把全书对上游的侵入方式排成一列,会发现它们明确分成**红白两级**。**白的一级是配置钩子**:走上游公开承诺的扩展点,不碰任何内部函数——7.3.1 的 d 已示范过一例,direct_register_custom_op 只用 torch.library 的公开原语(lib.define、lib.impl、lib._register_fake)自组装注册;第 8 章将看到的两个 Inductor config 键同属此列。**红的一级是 monkey-patch**:替换上游模块的内部函数,torch 一升级就可能碎,本节的 env_override.py 就是红的一级的集中营——它从 import vllm 的第一刻就开始工作。补丁栈逐条清点,每条一句话说清"补什么、对应哪个上游 PR、何时可移除":
+
+- `memory_plan_reuse`:torch 2.9 的 PythonWrapperCodegen 内存规划在多 piece 输出场景出错,补丁换掉它;上游修复见 pytorch#165514。
+- `get_graph_partition_signature`:修 Inductor 分区与 attention-nvfp4 量化融合的冲突;上游修复见 pytorch#165815。
+- `Scheduler.should_partition`:专为 `unified_attention_with_output` 这类带 in-place mutation 的 splitting op 绕开 Inductor 的 `origin_node` 断言,让 vLLM 自己的分区函数说了算。
+- `get_raw_stream`:compile_sizes>1 时 Inductor autotune 调用了未定义的 get_raw_stream();仅打在 torch 2.9.0/2.9.1(vllm issue #30905)。
+- `GraphCaptureOutput.get_runtime_env`:torch<2.12 的 AOT 路径漏收 builtins,transformers 代码触发 "Missing required external references";镜像上游 pytorch#177558,torch≥2.12 成为最低支持版即可移除。
+- `FxGraphCachePickler.dumps`:torch 2.10 序列化非标准布局张量(如 blocked-layout 预打包权重)时缓存失败;上游 mainline 已修(pytorch#176557),这是给 2.10 用户的薄回填,弃用 2.10 后移除。
+
+与本章最相关的是 **`FALLBACK_ALLOW_LIST`(fallback 白名单)** 的 fast-path 补丁,三句话讲完。第一句,慢路径的代价:当 Inductor 遇到没有注册 lowering 的自定义算子(如 `vllm::all_reduce`),若其 base_name 不在白名单里,`GraphLowering.call_function` 会走慢路径,对整个输入 IR 树做代价高昂的字符串化日志——对深层 TP/MoE 图这能吃掉数分钟编译时间。第二句,代理对象恒真:补丁把白名单换成一层的代理集合,让所有 `vllm::`、`vllm_aiter::` 前缀的算子在成员判断里恒真,一律送上 fast-path。第三句,其余照旧:代理只劫持成员判断这一件事,add、迭代、其余成员判断仍委托原集合——最小的补丁面,恰好只修"贵"的那一步(补丁栈与代理的锚点均见章末索引)。
 
 【哲学时刻】命题 **P4「最小侵入上游」** 在这里体现为一种张力中的纪律:补丁是现实(上游发版节奏跟不上 vLLM 需求),但每个补丁都被版本条件圈死、附上上游 PR 号与移除条件——侵入是待偿还的债,不是资产。PyTorch 官方博客已经提到 guard dropping、custom-op 的 CUDA Graph 分区等能力正在上游化:墙与桥的语义一旦被上游接纳,vLLM 侧的补丁与私有机制就能逐个退役。
 
@@ -273,6 +317,8 @@ vLLM 与 PyTorch 的边界不只画在算子上,还画在运行时补丁上。`i
 
 | 维度 | opaque custom op(墙) | transparent IR op(桥) |
 |---|---|---|
+| 一句话 | 集装箱:整箱吊走,永不拆箱 | 预制板:整块进场,后期替换,边缘可浇筑 |
+| 对编译器 | 全不可见(schema 之内才可见) | 可见但整块(终被内联替换,内容全部参与编译) |
 | 代表 | `unified_attention_with_output` | `vllm_ir::fused_add_rms_norm` |
 | 注册 | `direct_register_custom_op` → `Library("vllm")` | `register_op` → `Library("vllm_ir")` |
 | 编译期命运 | 不进 Inductor,作为 splitting point 切图(第 6 章) | 整块节点存活到 post-grad,必被 lowering 替换 |
@@ -282,11 +328,14 @@ vLLM 与 PyTorch 的边界不只画在算子上,还画在运行时补丁上。`i
 | 实现选择 | 静态:构建期选定 attention backend | 动态:`dispatch` 按 provider 优先级 + `supports_args` |
 | 服务于 | CUDA Graph 静态语义、后端可插拔 | pattern 融合、activation donation、平台实现可插拔 |
 
+一句话收束:`vllm_ir`/IrOp 的用途,是把"最适合融合的算子"以整块、可替换、可插拔的中间形态送进编译世界——它不是又一种算子注册方式,而是与墙互补的另一半边界设计:**墙说"这里编译器不必懂",桥说"这里编译器必须懂,但要按我的节奏懂"。**
+
 ## 7.4 本章小结
 
 - 注意力算子注册为不透明 custom op,墙内对编译器不可见
 - 输出调用方分配加 mutates_args,图内零分配、cudagraph 友好
 - 零元素张量人造数据依赖,锁死 KV 写与 attention 的顺序
+- 六条设计三对分工:造墙(零窥视/ForwardContext)、驯服副作用(外部分配/人造依赖)、清零过路费(reshape 外提/直注册)
 - vllm_ir 算子拒收 ATen 分解,整块存活直到 lowering 替换
 - activation donation 用编译期证明删掉运行时防御性 clone
 
@@ -307,19 +356,23 @@ vLLM 与 PyTorch 的边界不只画在算子上,还画在运行时补丁上。`i
 | `vllm/model_executor/layers/attention/attention.py:862-867` | 注册:`mutates_args=["output","output_block_scale"]` |
 | `vllm/utils/torch_utils.py:901`(`direct_register_custom_op`) | 绕过 `torch.library.custom_op` 的 dispatch 开销 |
 | `vllm/ir/op.py:21`(`vllm_ir_torch_lib`) | `Library("vllm_ir","FRAGMENT")` |
-| `vllm/ir/op.py:155`(`IrOp`) | schema 推断、注册、拒收分解(`:222`) |
+| `vllm/ir/op.py:155`(`IrOp`) | schema 推断、注册、拒收分解(`:222`);激活参数名约定(`:179-185`)与 `activation_indices`(`:192`) |
 | `vllm/ir/op.py:327`(`dispatch`) | provider 优先级选择(hot path) |
+| `vllm/ir/op.py:415`/`:429` | `set_default`(进程级)/`set_priority`(作用域)设定 provider 优先级 |
+| `vllm/ir/op.py:50`/`:368` | `_ENABLE_TORCH_WRAP` 关闭时 `__call__` 绕过 dispatch 直调(eager 快捷通道) |
 | `vllm/ir/op.py:481/500`(`IrOpInplace`/`IrOpInplaceOverload`) | `maybe_inplace` overload(`:515-517`,无 clone `:536-539`) |
 | `vllm/ir/op.py:542`(`IrOpImpl`) | `func_impl_fn`(`:650`)恢复函数语义;`uuid`(`:638`) |
 | `vllm/ir/ops/layernorm.py:9/43` | `rms_norm` / `fused_add_rms_norm` |
 | `vllm/model_executor/layers/layernorm.py:88` | 模型侧调用 `maybe_inplace` |
 | `vllm/compilation/backends.py:934`(`configure_post_pass`) | pre-grad 钩子注入(`:939`) |
 | `vllm/compilation/passes/ir/inplace_functionalization.py:21` | donation 证明与 donated_input_ids(`:68-90`) |
-| `vllm/compilation/passes/ir/lowering_pass.py:25`(`VllmIRLoweringPass`) | 模式注册(`:38`)、`replace_by_example`(`:67-69`)、`uuid`(`:115`) |
-| `vllm/compilation/passes/ir/clone_elimination.py:72`(`UnsafeCloneEliminationPass`) | 三道守卫与 clone 删除 |
+| `vllm/compilation/passes/ir/lowering_pass.py:25`(`VllmIRLoweringPass`) | 模式注册(`:38-41`)、`lower_matched_op`(`:43`)与 selected_impls(`:54-55`)、`replace_by_example`(`:67-69`)、`uuid`(`:115`) |
+| `vllm/compilation/passes/ir/clone_elimination.py:72`(`UnsafeCloneEliminationPass`) | 三道守卫与 clone 删除:layout 保持(`:19-36`)、单写分析(`:39-69`)、死值与捐赠名单(`:120-144`);docstring 自白不做别名分析(`:74-81`) |
 | `vllm/compilation/passes/pass_manager.py:123-138` | post-grad 固定执行顺序 |
 | `vllm/compilation/passes/inductor_pass.py:29-37` | `PassContext.donated_input_ids` |
-| `vllm/env_override.py:793-858`(`FALLBACK_ALLOW_LIST`) | `vllm::*/vllm_aiter::*` fast-path 代理 |
+| `vllm/__init__.py:14` | import vllm 即执行 env_override |
+| `vllm/env_override.py:130`/`:198`/`:360`/`:468`/`:582`/`:606` | 红补丁栈:`memory_plan_reuse`(pytorch#165514)、`get_graph_partition_signature`(pytorch#165815)、`should_partition`(`:443` 经 `_update_scheduler_patched` 注入)、`get_raw_stream`(issue #30905,仅 torch 2.9.0/2.9.1)、`get_runtime_env`(pytorch#177558,torch≥2.12 可移除)、`dumps`(pytorch#176557,弃用 2.10 后移除) |
+| `vllm/env_override.py:793-858`(`FALLBACK_ALLOW_LIST`) | `vllm::*/vllm_aiter::*` fast-path 代理(代理类 `:796`、恒真判断 `:804-807`、委托原集合 `:815-825`) |
 
 ### 参考资料
 

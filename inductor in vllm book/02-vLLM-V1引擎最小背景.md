@@ -2,7 +2,7 @@
 chapter: 2
 part: I
 title: vLLM V1 引擎最小背景:编译所服务的运行时
-status: done
+status: review
 difficulty: ★★
 depends: [1]
 ---
@@ -23,6 +23,24 @@ VI  收官:   [14 设计哲学] → [15 动手实践]
 要理解 vLLM 怎样使用 torch.compile,得先回答一个更根本的问题:编译出来的东西,到底运行在一个什么样的世界里?第 1 章已经说明,生成式推理的 decode 阶段每步只算一两个 token,计算量小到喂不饱 GPU,真正的瓶颈在 CPU 侧的 Python 编排与 kernel 启动(详见第 1 章)。而 torch.compile 消灭的恰恰是 Python 开销——但它只优化被捕获的那一段代码。如果每一步执行时还要现造输入张量、现查请求状态、现走一堆 if/else 分支,那么编译图之外的开销会原样回来,优化等于白做。
 
 本章先给答案的预告:vLLM 的 V1 引擎把每一步执行规约成三件事——查一次表决定本步调度哪些 token、往几块固定不变的显存里填一份数据、调用一个预先编译好的函数。在这个世界里,唯一随时间变化的量是一个整数:本步的 token 总数。后面所有章节的编译机制——为什么敢只编译一次(第 5 章)、为什么切图要切在注意力上(第 6、7 章)、为什么尺寸要建表分桶(第 4 章)、为什么 CUDA Graph 敢整段重放(第 12 章)——全部从这个运行时形状里生长出来。换句话说,不是 vLLM 在现有运行时上"加了编译",而是运行时本身被重新塑形成了编译友好的形状。本章就是把这个形状看清楚。
+
+先把本章放进整条推理服务链:
+
+```text
+推理服务(每个 step 循环一次)
+│
+├─ V1 调度器 ◄== 本章:两个数字喂出 num_tokens
+│    ├─ schedule():running 优先、token 预算、chunked prefill
+│    └─ 产出:本 step 输入张量(num_tokens 行)+ KV 写入计划
+│
+├─ 模型 forward(num_tokens 成为后文全图唯一的动态维)
+│    ├─ eager 执行
+│    └─ torch.compile(第 3 章起进入编译栈)
+│
+├─ 采样 / 输出
+│
+└─ KV cache 读写贯穿始终
+```
 
 ## 2.1 最小前置知识
 
@@ -51,31 +69,24 @@ VI  收官:   [14 设计哲学] → [15 动手实践]
 
 从前端到 GPU 的完整链路是五站:`AsyncLLM` → `EngineCore` → **`Scheduler`(调度器)** → **`GPUModelRunner`(GPU 模型执行器)** → 编译后的模型。逐站看流水线产物:
 
-> `AsyncLLM.generate`(`vllm/v1/engine/async_llm.py:544`)从 API server 收到 prompt 与采样参数 → 调 `add_request` 校验并打包(`async_llm.py:579`)→ 产出一条 `EngineCoreRequest` 消息,经 ZMQ 发往 EngineCore 进程;同时后台的 `output_handler` 任务(`async_llm.py:676`)持续把 EngineCore 回传的输出分发到各请求的输出流。
+> `AsyncLLM.generate` 从 API server 收到 prompt 与采样参数 → 调 `add_request` 校验并打包 → 产出一条 `EngineCoreRequest` 消息,经 ZMQ 发往 EngineCore 进程;同时后台的 `output_handler` 任务持续把 EngineCore 回传的输出分发到各请求的输出流。
 
-> `EngineCoreProc.run_busy_loop`(`vllm/v1/engine/core.py:1378`)在独立进程里循环处理输入队列,有活就调 `step`(`core.py:584`)→ 一次 `step` 内完成"调度 → 执行 → 更新"→ 产出 `EngineCoreOutputs` 经 ZMQ 回前端。busy loop 里没有定时器轮询,常规路径也不 sleep:有活时立刻推进下一步,空闲时才阻塞在输入队列上等新请求(`core.py:1420`);唯一例外是"本步没执行模型但调度器仍有请求"的边缘情形,会让出 1ms 供后台传输线程推进——GPU 一旦忙起来就永远有下一步可做。
+> `EngineCoreProc.run_busy_loop` 在独立进程里循环处理输入队列,有活就调 `step` → 一次 `step` 内完成"调度 → 执行 → 更新"→ 产出 `EngineCoreOutputs` 经 ZMQ 回前端。busy loop 里没有定时器轮询,常规路径也不 sleep:有活时立刻推进下一步,空闲时才阻塞在输入队列上等新请求;唯一例外是"本步没执行模型但调度器仍有请求"的边缘情形,会让出 1ms 供后台传输线程推进——GPU 一旦忙起来就永远有下一步可做。
 
-`step` 是理解 V1 的钥匙,五步紧凑地挤在三十行里:
+`step` 是理解 V1 的钥匙。**为什么必须有它**:V1 把"一步"定义为一个原子推进——查表决定本步算谁、调用编译产物算出结果、采样并更新状态,三件事必须在同一个函数里完成;任何一环拆出去单独编排,Python 开销就会回到热路径,2.0 节的担忧就会成真。**怎么做**:一步 = 调度 → 执行 → 采样,核心只剩几行:
 
 ```python
-# vllm/v1/engine/core.py:584-614 (v0.27.1)
-def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
-    if not self.scheduler.has_requests():
-        return {}, False
-    scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
-    future = self.model_executor.execute_model(scheduler_output, non_block=True)
-    ...
-        model_output = future.result()
-        if model_output is None:
-            model_output = self.model_executor.sample_tokens(grammar_output)
-    ...
-    engine_core_outputs = self.scheduler.update_from_output(
-        scheduler_output, model_output
-    )
-    return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+# vllm/v1/engine/core.py:584-614 (v0.27.1,节选)
+scheduler_output = self.scheduler.schedule(...)  # 调度:本步每请求算几个 token
+future = self.model_executor.execute_model(scheduler_output, non_block=True)
+model_output = future.result()
+if model_output is None:  # 编译产物只算 hidden_states,采样是后置阶段
+    model_output = self.model_executor.sample_tokens(grammar_output)
+outputs = self.scheduler.update_from_output(scheduler_output, model_output)
+return outputs, scheduler_output.total_num_scheduled_tokens > 0
 ```
 
-注意两个细节:其一,`execute_model(non_block=True)` 返回 future,调度与输入准备可以和上一步的收尾重叠;其二,采样被拆成独立的 `sample_tokens` 阶段——这是 2.3.5 节"图外采样"在控制流上的体现。`step` 的返回值第二项是"本步是否真的执行了模型",busy loop 据此决定空转还是推进。
+注意两个细节:其一,`execute_model(non_block=True)` 返回 future,调度与输入准备可以和上一步的收尾重叠;其二,采样被拆成独立的 `sample_tokens` 阶段——这是 2.3.5 节"图外采样"在控制流上的体现。`step` 的返回值第二项是"本步是否真的执行了模型",busy loop 据此决定空转还是推进。**交给下一环什么**:`step` 最重要的中间产物是 `SchedulerOutput`——调度如何在没有阶段概念的世界里产出这份决定,正是 2.3.2 节的主题;一次完整调用的时序见下图。
 
 ```mermaid
 sequenceDiagram
@@ -105,31 +116,17 @@ sequenceDiagram
 
 ### 2.3.2 调度:没有 prefill 阶段,也没有 decode 阶段
 
-> `Scheduler.schedule`(`vllm/v1/core/sched/scheduler.py:439`)从 EngineCore 拿到待调度的请求集合(waiting 队列与 running 队列)→ 在 `token_budget = max_num_scheduled_tokens`(`scheduler.py:459`)的预算内,为每个请求分配"本步算几个 token",运行中的请求优先(`scheduler.py:483-485`)→ 产出一份 **`SchedulerOutput`(调度器输出)**(`vllm/v1/core/sched/output.py:193`),交回 `step` 去执行。
+> `Scheduler.schedule` 从 EngineCore 拿到待调度的请求集合(waiting 队列与 running 队列)→ 在 `token_budget = max_num_scheduled_tokens` 的预算内,为每个请求分配"本步算几个 token",运行中的请求优先 → 产出一份 **`SchedulerOutput`(调度器输出)**,交回 `step` 去执行。
 
-V1 调度的关键观念写在源码的一条 NOTE 里,值得整段意译:
+V1 调度的关键观念写在源码的一条 NOTE 里,值得整段意译:每个请求只有两个数字——已经算完多少、总共要算多少,调度就是让前者追上后者。prefill 是"差得多"的请求,decode 是"差一个"的请求,chunked prefill 是"差得多但本步只分给它一块"的请求,推测解码是"一次追好几个"的请求——同一套算法自然覆盖全部情形。对编译而言这意味着革命性的简化:**执行侧不需要为任何"阶段"准备不同的图,一条路径打天下。**
 
-```python
-# vllm/v1/core/sched/scheduler.py:441-450 (v0.27.1)
-# NOTE(woosuk) on the scheduling algorithm:
-# There's no "decoding phase" nor "prefill phase" in the scheduler.
-# Each request just has the num_computed_tokens and
-# num_tokens_with_spec. ...
-# At each step, the scheduler tries to assign tokens to the requests
-# so that each request's num_computed_tokens can catch up its
-# num_tokens_with_spec. This is general enough to cover
-# chunked prefills, prefix caching, speculative decoding, ...
-```
-
-每个请求只有两个数字:已经算完多少、总共要算多少。调度就是让前者追上后者。prefill 是"差得多"的请求,decode 是"差一个"的请求,chunked prefill 是"差得多但本步只分给它一块"的请求,推测解码是"一次追好几个"的请求——同一套算法自然覆盖全部情形。对编译而言这意味着革命性的简化:**执行侧不需要为任何"阶段"准备不同的图,一条路径打天下。**
-
-`SchedulerOutput` 里两个承重字段:`num_scheduled_tokens: dict[str, int]`(请求号 → 本步 token 数,`output.py:205`)与 `total_num_scheduled_tokens`(全部之和,`output.py:208`)。另有 `scheduled_new_reqs` / `scheduled_cached_reqs` 只传新请求或增量(diff)——请求的完整状态缓存在 worker 侧,不逐步重发,通信本身也是零冗余的。
+`SchedulerOutput` 里两个承重字段:`num_scheduled_tokens: dict[str, int]`(请求号 → 本步 token 数)与 `total_num_scheduled_tokens`(全部之和)。另有 `scheduled_new_reqs` / `scheduled_cached_reqs` 只传新请求或增量(diff)——请求的完整状态缓存在 worker 侧,不逐步重发,通信本身也是零冗余的。
 
 ### 2.3.3 核心例子:ragged batch [2, 5, 3]
 
 现在看全书贯穿的例子。设本步调度 3 个请求,`num_scheduled_tokens = [2, 5, 3]`:请求 0 算 2 个 token(prefill 的一块),请求 1 算 5 个(另一块),请求 2 算 3 个(可能是 decode 拼推测解码)。GPU 侧如何把这份"参差"的决策变成一个标准的 forward?
 
-> `_prepare_inputs`(`vllm/v1/worker/gpu_model_runner.py:1960`)从 `SchedulerOutput` 拿到每请求的 token 数数组 → 用 `np.repeat` 与 `cumsum` 把二维的"请求 × token"展平成一维 → 产出三组下标(`req_indices`、`query_start_loc`、`positions`),写入常驻 buffer,供 `_preprocess`(`gpu_model_runner.py:3545`)组装成编译图的输入。
+> `_prepare_inputs` 从 `SchedulerOutput` 拿到每请求的 token 数数组 → 用 `np.repeat` 与 `cumsum` 把二维的"请求 × token"展平成一维 → 产出三组下标(`req_indices`、`query_start_loc`、`positions`),写入常驻 buffer,供 `_preprocess` 组装成编译图的输入。
 
 ```python
 # vllm/v1/worker/gpu_model_runner.py:1981-1989 (v0.27.1)
@@ -160,15 +157,15 @@ query_start_loc = [0 2 7 10 10 10 …]        ← 尾部非递减, FA kernel 要
 positions     = num_computed_tokens[req_indices] + query_pos   ← 绝对位置
 ```
 
-几个下标各司其职:`req_indices` 让每个 token 知道自己属于哪个请求;`positions` 由"该请求已算完的 token 数 + 组内位置"得到绝对位置;`query_start_loc`(长度 num_reqs+1)是每个请求在展平序列里的边界,尾部用 `cu_num_tokens[-1]` 填成非递减——`gpu_model_runner.py:2073-2079` 的注释明说,这是 FlashAttention 一类 kernel 的要求。取 token 本身用 `torch.index_select` 写进常驻 buffer(`gpu_model_runner.py:2019-2023`,注释解释了为何不用 `np.take`:大张量上 `index_select` 快得多)。至此,"3 个请求各算几个"的调度决策变成了一个干净的 10-token 一维 batch:`input_ids[10]`、`positions[10]`,外加一份描述参差结构的 attention 元数据。
+几个下标各司其职:`req_indices` 让每个 token 知道自己属于哪个请求;`positions` 由"该请求已算完的 token 数 + 组内位置"得到绝对位置;`query_start_loc`(长度 num_reqs+1)是每个请求在展平序列里的边界,尾部用 `cu_num_tokens[-1]` 填成非递减——源码注释明说,这是 FlashAttention 一类 kernel 的要求。取 token 本身用 `torch.index_select` 写进常驻 buffer(注释解释了为何不用 `np.take`:大张量上 `index_select` 快得多)。至此,"3 个请求各算几个"的调度决策变成了一个干净的 10-token 一维 batch:`input_ids[10]`、`positions[10]`,外加一份描述参差结构的 attention 元数据。
 
 ### 2.3.4 零分配哲学:常驻 buffer 与持久 batch
 
 展平结果之所以能"写入"而非"创建",是因为目标内存在启动时就已存在:
 
-> `GPUModelRunner` 在初始化时按上限一次性预分配全部输入 buffer(`gpu_model_runner.py:764` 起):`input_ids`、`positions`、`query_start_loc`、`seq_lens`、`req_indices` 等各一块,长度都是 `max_num_reqs` 或 `max_num_tokens` → 每步只做两件事:CPU 侧 `buffer.cpu[:total]` 写入(如 `gpu_model_runner.py:2023`),GPU 侧 `buffer.gpu[:num_input_tokens]` 切片(`_preprocess`,`gpu_model_runner.py:3653` 取 `input_ids`、`:3662` 取 `positions`)→ 产出"地址永远不变的输入张量"直接喂给编译图。
+> `GPUModelRunner` 在初始化时按上限一次性预分配全部输入 buffer:`input_ids`、`positions`、`query_start_loc`、`seq_lens`、`req_indices` 等各一块,长度都是 `max_num_reqs` 或 `max_num_tokens` → 每步只做两件事:CPU 侧往 `buffer.cpu[:total]` 写入,GPU 侧按 `buffer.gpu[:num_input_tokens]` 切片 → 产出"地址永远不变的输入张量"直接喂给编译图。
 
-请求状态同样是持久的。**`InputBatch`(持久输入批状态)**(`vllm/v1/worker/gpu_input_batch.py:92`)常驻内存,持有全部在批请求的 token 表、块表、采样参数等;每步的 `_update_states`(`gpu_model_runner.py:1192`)拿到 `SchedulerOutput` 后只做增删改——结束的请求 `remove_request`(`gpu_model_runner.py:1217`)、新请求写入空位、幸存请求原地更新——而不重建任何容器。这种"静态内存 + 动态内容"的取向甚至渗入 attention 后端的细节:`v1/attention/backends/flash_attn.py:294-295` 的注释解释了为何把一个 `[1]` 的 int32 窗口张量在 `build()` 里预分配——"这样 forward() 内部在 CUDA graph capture 期间就不需要 CPU→GPU 拷贝"。
+请求状态同样是持久的。**`InputBatch`(持久输入批状态)**(`vllm/v1/worker/gpu_input_batch.py:92`)常驻内存,持有全部在批请求的 token 表、块表、采样参数等;每步的 `_update_states`(`gpu_model_runner.py:1192`)拿到 `SchedulerOutput` 后只做增删改——结束的请求移出、新请求写入空位、幸存请求原地更新——而不重建任何容器。这种"静态内存 + 动态内容"的取向甚至渗入 attention 后端的细节:`v1/attention/backends/flash_attn.py:294-295` 的注释解释了为何把一个 `[1]` 的 int32 窗口张量在 `build()` 里预分配——"这样 forward() 内部在 CUDA graph capture 期间就不需要 CPU→GPU 拷贝"。
 
 这一切都是在为第 12 章铺路:capture 一张 CUDA Graph 要求图内读写过的每块显存地址在重放时依然有效,零分配哲学恰好保证了这一点;启动后 `set_cudagraph_capturing_enabled(False)`(`gpu_model_runner.py:6900`)一执行,任何"运行期还想捕获"的意外都会直接报错——capture 结束即锁定,不变量靠断言维护。
 
@@ -176,7 +173,7 @@ positions     = num_computed_tokens[req_indices] + query_pos   ← 绝对位置
 
 模型 forward 的输出是全部 token 的 `hidden_states`,但自回归推理下一步只需要每个请求**最后一个** token 的 logits。这个"降维"发生在编译图之外:
 
-> `_prepare_inputs` 产出 **`logits_indices`(logits 下标)**——非推测解码时就是 `query_start_loc[1:] - 1`(`gpu_model_runner.py:2239`),即每请求右边界减一;推测解码时改由 `spec_decode_metadata` 提供 → `execute_model` 在 forward 返回后执行 `hidden_states[logits_indices]` 再调 `model.compute_logits`(`gpu_model_runner.py:4484-4485`)→ 产出 logits 交给后置的 `sample_tokens`(`gpu_model_runner.py:4553`,在 `core.py:603-604` 被 `step` 调用)完成采样。
+> `_prepare_inputs` 产出 **`logits_indices`(logits 下标)**——非推测解码时就是 `query_start_loc[1:] - 1`,即每请求右边界减一;推测解码时改由 `spec_decode_metadata` 提供 → `execute_model` 在 forward 返回后执行 `hidden_states[logits_indices]` 再调 `model.compute_logits` → 产出 logits 交给后置的 `sample_tokens` 完成采样。
 
 为什么 `compute_logits`(语言模型头)与采样器不进编译图?三个理由叠加。第一,形状不划算:lm_head 输出是 `[num_reqs, vocab]`,词表数万、请求数每步在变,这是全模型最大的张量之一,而真正需要的只有每请求一行——先在图外用 `logits_indices` 把 `hidden_states` 缩到 `[num_reqs, hidden]` 再投影,计算量小几个量级。第二,采样器是分支密集的 Python 代码:温度、top-p、top-k、惩罚项、结构化输出各走各的路径,强行进图会把图撕成碎片,违背"整图一次编译"的初衷。第三,采样需要 CPU 上的调度信息(每个请求的采样参数),天然属于编排世界。于是边界自然落在"norm 之后的 hidden_states"处:图内是纯张量到张量的变换,图外是"形状与控制流随请求集合变化"的一切。
 
@@ -226,7 +223,7 @@ flowchart TB
 
 还有一个难题没有解决。attention 是图内算子,但它每步需要的信息——`query_start_loc`、`seq_lens`、`block_table`、`slot_mapping`——全都是随批内容变化的动态数据。这些数据如果编进图里,图就得每步重编;不传进图里,attention 又无从计算。V1 的解法是把它们放进一个每步重建、但**对图不可见**的侧信道:
 
-> `GPUModelRunner.execute_model` 在调用模型前,把本步的 attention 元数据与执行模式装进 **`ForwardContext`(前向上下文)**(`vllm/forward_context.py:132`),字段包括 **`attn_metadata`(注意力元数据)**(按注意力层名索引的 `FlashAttentionMetadata` 等,字段如 `num_actual_tokens`、`max_query_len`、`query_start_loc`、`seq_lens`、`block_table`、`slot_mapping`,见 `vllm/v1/attention/backends/flash_attn.py:243-258`)、`cudagraph_runtime_mode`(`forward_context.py:148`)与 `batch_descriptor`(`forward_context.py:149`)→ 经 `set_forward_context` 上下文管理器(`forward_context.py:260`)写入进程级全局,精确包住 `_model_forward` 这一次调用(`gpu_model_runner.py:4433-4456`)→ 图内的 attention 算子在执行时经 `get_forward_context()`(`forward_context.py:199`)取回**当步**的元数据。
+> `GPUModelRunner.execute_model` 在调用模型前,把本步的 attention 元数据与执行模式装进 **`ForwardContext`(前向上下文)**,字段包括 **`attn_metadata`(注意力元数据)**(按注意力层名索引的 `FlashAttentionMetadata` 等,字段如 `num_actual_tokens`、`max_query_len`、`query_start_loc`、`seq_lens`、`block_table`、`slot_mapping`)、`cudagraph_runtime_mode` 与 `batch_descriptor` → 经 `set_forward_context` 上下文管理器写入进程级全局,精确包住 `_model_forward` 这一次调用 → 图内的 attention 算子在执行时经 `get_forward_context()` 取回**当步**的元数据。
 
 ```text
 「示意图」gpu_model_runner.py:4432-4456 的包裹结构
@@ -268,6 +265,7 @@ _model_forward( input_ids, positions, ... )
 | `vllm/v1/engine/core.py:584-614`(`step`) | 调度 → 执行 → 采样的单步主循环 |
 | `vllm/v1/engine/core.py:1008`(`EngineCoreProc`) | EngineCore 的 ZMQ 进程包装 |
 | `vllm/v1/engine/core.py:1378`(`run_busy_loop`) | 独立进程内的忙循环 |
+| `vllm/v1/engine/core.py:1420` | busy loop 无轮询无 sleep,仅"未执行但仍有请求"时让出 1ms |
 | `vllm/v1/core/sched/scheduler.py:439-459`(`schedule`) | 无阶段调度与 token 预算 |
 | `vllm/v1/core/sched/output.py:193-208`(`SchedulerOutput`) | `num_scheduled_tokens` 与 `total_num_scheduled_tokens` |
 | `vllm/v1/worker/gpu_model_runner.py:764` 起 | 按 `max_num_tokens` 预分配常驻 buffer |
@@ -282,6 +280,8 @@ _model_forward( input_ids, positions, ... )
 | `vllm/v1/worker/gpu_model_runner.py:4553`(`sample_tokens`) | 后置采样阶段 |
 | `vllm/v1/worker/gpu_model_runner.py:6900` | `set_cudagraph_capturing_enabled(False)`:capture 即锁定 |
 | `vllm/forward_context.py:132`(`ForwardContext`) | 前向上下文字段(attn_metadata 等) |
+| `vllm/forward_context.py:148-149` | `cudagraph_runtime_mode` 与 `batch_descriptor` 字段(第 12 章侧信道) |
+| `vllm/forward_context.py:199`(`get_forward_context`) | 图内算子取当步上下文 |
 | `vllm/forward_context.py:260`(`set_forward_context`) | 上下文管理器写入/恢复全局 |
 | `vllm/v1/worker/gpu_input_batch.py:92`(`InputBatch`) | 持久输入批状态 |
 | `vllm/v1/attention/backends/flash_attn.py:243-258` | `FlashAttentionMetadata` 字段速览 |

@@ -2,7 +2,7 @@
 chapter: 10
 part: IV
 title: 图变换流水线:PostGradPassManager 与自定义 fusion
-status: done
+status: review
 difficulty: ★★★★
 depends: [3, 7, 8, 9]
 ---
@@ -24,10 +24,34 @@ VI  收官:   [14 设计哲学] → [15 动手实践]
 
 这一切的底层动机仍是全书的叙事主线:decode 是 CPU/launch bound → 必须消灭 Python 开销 → 代价是编译 → 编译代价是启动时间 → 所以全部编译前置并缓存。融合在这条链上是"一鱼两吃"的买卖:它既减少 kernel 数量( fewer launch,直接缓解 CPU bound),又砍掉中间张量的显存往返(归一化、量化这类算子是带宽瓶颈,少读写一次就是实打实的时延)。而所有这些模式匹配、区间门控、去泛函化的复杂分析都发生在启动期,serve 期一步都不用再付钱。
 
+先把本章放进整条编译管线:
+
+```text
+torch.compile(model)
+│
+├─ dynamo 一次捕获 ─▶ 整图 FX(唯一符号维 num_tokens)
+├─ 切分 ─▶ submod_0..N
+│
+├─ 全量预编译(片段 × range)
+│    └─ compile_fx
+│         ├─ AOTAutograd(泛函化 + shape 参数化)
+│         │
+│         ├─ post_grad pass 流水线 ◄== 本章(六拍,range 门控)
+│         │    ├─ ① 配置的融合 pass(逐个按区间门控)
+│         │    ├─ ②⑤ PostCleanup:两遍清理
+│         │    ├─ ③ VllmIRLowering ④ UnsafeCloneElimination
+│         │    └─ ⑥ FixFunctionalization 永远殿后
+│         │
+│         └─ Inductor lowering / codegen ─▶ kernel
+│
+├─ 造外壳
+└─ serve 期:查 range 执行
+```
+
 ## 10.1 最小前置知识
 
-1. **`post_grad_custom_post_pass`(后置自定义 pass 钩子)**:Inductor config 的一个键,允许在 AOTAutograd 之后、Inductor 后端编译之前对 FX 图做任意变换。vLLM 在 VllmBackend 六步流水线的第②步 `configure_post_pass` 里把整个 pass 管理器注入此键(`vllm/compilation/backends.py:1171` 调用,定义于 `:934`),详见第 8 章。
-2. **`PassContext`(pass 上下文)与 `compile_range`(编译区间)**:一个线程级全局状态,由 `CompilerManager.compile_context`(`backends.py:150`,`with pass_context(compile_range)` 在 `:154`)在每次 Inductor 编译前设置,携带当前编译的 token 数区间与 `donated_input_ids`,详见第 9 章。
+1. **`post_grad_custom_post_pass`(后置自定义 pass 钩子)**:Inductor config 的一个键,允许在 AOTAutograd 之后、Inductor 后端编译之前对 FX 图做任意变换。vLLM 在 VllmBackend 六步流水线的第②步 `configure_post_pass` 里把整个 pass 管理器注入此键(详见第 8 章)。
+2. **`PassContext`(pass 上下文)与 `compile_range`(编译区间)**:一个线程级全局状态,由 `CompilerManager.compile_context` 在每次 Inductor 编译前设置,携带当前编译的 token 数区间与 `donated_input_ids`,详见第 9 章。
 3. **`auto_functionalized`(自动泛函化形态)**:AOTAutograd 把 in-place 算子改写成的纯函数等价形态——返回一个元组,各被改写的参数经 `operator.getitem` 取回。本章所有 fusion 的"替换侧"都写成这个形态,详见第 7 章。
 4. **vllm_ir 算子**:`Library("vllm_ir","FRAGMENT")` 注册的透明 IR 算子(如 `rms_norm`),拒绝 ATen 分解、以整块节点存活到 post-grad,是本章 pattern 的锚点,详见第 7 章。
 5. **Inductor 代码缓存与 pass uuid**:torch 的 custom graph pass 机制要求每个挂进 config 的 pass 提供 **uuid(身份哈希)**,它会参与 Inductor FxGraphCache 的缓存键——uuid 一变,对应缓存自动失效。
@@ -52,9 +76,9 @@ VI  收官:   [14 设计哲学] → [15 动手实践]
 
 ### 10.3.1 固定序:PostGradPassManager 的六拍
 
-> **上游给我**:泛函化的 post-grad FX 图(AOTAutograd 产物,经 Inductor `post_grad_custom_post_pass` 钩子送达,注入点 `backends.py:971`,调用链见第 8 章第②步)→ **我做**:按固定序执行配置的 pass 列表(fusion 为主,range 门控)与四个固定 pass → **产出**:mutation 风格、可直接消费的 FX 图,继续流入 Inductor 的 post-grad lowering 与代码生成。
+> **上游给我**:泛函化的 post-grad FX 图(AOTAutograd 产物,经 Inductor `post_grad_custom_post_pass` 钩子送达,注入与调用链见第 8 章第②步)→ **我做**:按固定序执行配置的 pass 列表(fusion 为主,range 门控)与四个固定 pass → **产出**:mutation 风格、可直接消费的 FX 图,继续流入 Inductor 的 post-grad lowering 与代码生成。
 
-`PostGradPassManager`(`vllm/compilation/passes/pass_manager.py:91`)的 `__call__`(`:109-141`)是一条不可重排的传送带:
+`PostGradPassManager`(`vllm/compilation/passes/pass_manager.py:91`)的 `__call__` 是一条不可重排的传送带:
 
 ```python
 # vllm/compilation/passes/pass_manager.py:113-141 (v0.27.1,节选)
@@ -72,7 +96,7 @@ VI  收官:   [14 设计哲学] → [15 动手实践]
         VllmPatternMatcherPass.log_match_summary()   # 全局命中统计
 ```
 
-其中 ②③④⑤ 的先后是两处源码注释明说的:第一遍 `post_cleanup` 在 IR lowering **之前**,"clean up fusion artifacts and make sure no dead IR ops are lowered"(`:121-122`);而 `ir_lowering` 在 DCE **之前**,"so DCE can clean up lowered ops. DCE handles mutating ops correctly as well"(`:126-127`)。**`PostCleanupPass`(清理 pass)**(`vllm/compilation/passes/utility/post_cleanup.py:8`)做两件事:torch 的 `stable_topological_sort` + `graph.eliminate_dead_code()`——模式匹配不保证产出拓扑有序的图,也不保证不留死节点。③④ 两步即第 7 章详述的 `VllmIRLoweringPass` 与 `UnsafeCloneEliminationPass`(activation donation 的后半程),本章不重复。
+其中 ②③④⑤ 的先后是两处源码注释明说的:第一遍 `post_cleanup` 在 IR lowering **之前**,"clean up fusion artifacts and make sure no dead IR ops are lowered"(`:121-122`);而 `ir_lowering` 在 DCE **之前**,"so DCE can clean up lowered ops. DCE handles mutating ops correctly as well"。**`PostCleanupPass`(清理 pass)**(`vllm/compilation/passes/utility/post_cleanup.py:8`)做两件事:torch 的 `stable_topological_sort` + `graph.eliminate_dead_code()`——模式匹配不保证产出拓扑有序的图,也不保证不留死节点。③④ 两步即第 7 章详述的 `VllmIRLoweringPass` 与 `UnsafeCloneEliminationPass`(activation donation 的后半程),本章不重复。
 
 ```mermaid
 flowchart LR
@@ -99,7 +123,7 @@ flowchart LR
   B ==> E --> F --> G --> H --> I --> J
 ```
 
-`configure`(`pass_manager.py:143-224`)负责"配置的 fusion passes"这一段:按 `pass_config` 各开关与平台门控的导入(`:21-57`,ROCm/aiter、CUDA 类、XPU 各自的 import 块)组装 `self.passes` 列表,并实例化四个固定 pass(`:221-224`)。列表顺序是刻意设计的:更特异的 pattern 先跑——`RocmAiterTritonAddRMSNormPadFusionPass` 排在 AR+RMS 之前,因为两者都消费 `fused_add_rms_norm`(`:169-172`);`AllReduceFusionPass` 排在 `RMSNormReshapeFusionPass` 之前,让 AR+RMS 先匹配、再由 reshape 前移把剩余 RMSNorm 暴露给 RMS+Quant(`:174-183`);`SplitCoalescingPass` 与 `ScatterSplitReplacementPass` 成对地排在 QkNormRopeKvCache 与 RopeKVCache 之前(`SplitCoalescingPass` 还单独排在 QKNormRoPE 之前,`:197-219`),先把 split/getitem 的碎片收拢,RoPE 系 pattern 才匹配得上。此外,用户经 `inductor_compile_config` 传入的 `post_grad_custom_post_pass` 若非管理器本身,会被 `add`(`:226-228`)追加到列表尾部、`FixFunctionalization` 之前(`backends.py:955-969`)——自定义 pass 与内置 pass 走同一条门控循环、同一个固定序。
+`configure` 负责"配置的 fusion passes"这一段:按 `pass_config` 各开关与平台门控组装 `self.passes` 列表,并实例化四个固定 pass。列表顺序是刻意设计的,原则只有一条——**更特异的 pattern 先跑**。具体落法:`RocmAiterTritonAddRMSNormPadFusionPass` 排在 AR+RMS 之前,因为两者都消费 `fused_add_rms_norm`,pad 这个更特异的版本必须先匹配;`AllReduceFusionPass` 排在 `RMSNormReshapeFusionPass` 之前,让 AR+RMS 先匹配、再由 reshape 前移把剩余 RMSNorm 暴露给 RMS+Quant;`SplitCoalescingPass` 与 `ScatterSplitReplacementPass` 成对地排在 QkNormRopeKvCache 与 RopeKVCache 之前(SplitCoalescingPass 还单独排在 QKNormRoPE 之前)——先把 split/getitem 的碎片收拢,RoPE 系 pattern 才匹配得上。而六拍层面的顺序——先在泛函化图上匹配替换、清障后再 lowering、去泛函化永远最后——由 10.2 的两条设计决定:泛函化让匹配可分析,FixFunctionalization 之后禁 DCE 所以必须收尾。此外,用户经 `inductor_compile_config` 传入的 `post_grad_custom_post_pass` 若非管理器本身,会被 `add` 追加到列表尾部、`FixFunctionalization` 之前——自定义 pass 与内置 pass 走同一条门控循环、同一个固定序(平台门控导入与上述排序的锚点见章末索引)。
 
 ### 10.3.2 身份即内容:uuid 如何进 Inductor 缓存键
 
@@ -122,31 +146,33 @@ flowchart LR
 
 ### 10.3.4 模式匹配框架:一套让"匹配侧"与"替换侧"同源的表达法
 
-> **上游给我**:**pattern(模式)**与 **replacement(替换体)**两个 tracing 闭包 + 示例输入(来自 `VllmPatternReplacement` 子类,`vllm_inductor_pass.py:197-249`)→ **我做**:在 fake mode 下把两侧各 trace 成 FX 子图,交 torch 的 `register_replacement` 建成匹配规则 → **产出**:注册进 `PatternMatcherPass` 的规则集,`__call__`(`:332-335`)时 `pm_pass.apply(graph)` 一次性完成全图匹配替换,命中数累入全局 **match_table(命中统计表)**。
+> **上游给我**:**pattern(模式)**与 **replacement(替换体)**两个 tracing 闭包 + 示例输入(来自 `VllmPatternReplacement` 子类)→ **我做**:在 fake mode 下把两侧各 trace 成 FX 子图,交 torch 的 `register_replacement` 建成匹配规则 → **产出**:注册进 `PatternMatcherPass` 的规则集,`__call__` 时 `pm_pass.apply(graph)` 一次性完成全图匹配替换,命中数累入全局 **match_table(命中统计表)**。
 
-**`VllmPatternReplacement`(模式替换对)** 是抽象基类:pattern/replacement 是 property 闭包(源码注释解释这是受 bound method tracing 限制的妥协,`:207-209`),`get_inputs` 提供示例张量,一组 `empty_bf16`/`empty_fp32` 等静态 helper(`:230-249`)把设备绑定到当前平台 `device_type`——平台可插拔(P6)在 pattern 层就生效了。**`VllmFusionPatternMatcherPass`(融合模式匹配 pass 基类)**(`:296-335`,继承 **`VllmPatternMatcherPass`(模式匹配 pass 基类)**,`:95-190`)的 `register` 与 `_trace_fn` 是框架核心:
+这套框架要回答的问题只有一个:几十个融合机会,如何用一套统一的表达法写出来——既让 torch 的模式匹配器认得,又不至于在"图里实际出现的形态"与"融合后的形态"之间两处手写、各自漂移。答案是把它拆成三件事:注册哪些 pattern、如何匹配、命中后如何替换。
 
-```python
-# vllm/compilation/passes/vllm_inductor_pass.py:308-317、:325-330 (v0.27.1,节选)
-    @enable_fake_mode
-    def register(self, pr: VllmPatternReplacement) -> None:
-        pm.register_replacement(
-            pr.pattern, pr.replacement,   # 待匹配 / 融合后子图的 tracing 闭包
-            pr.get_inputs(),              # 示例输入(fake mode 下不落真实显存)
-            self._trace_fn, self.pm_pass,
-        )
+**第一件事,注册哪些 pattern。** 每个融合机会是一个 **`VllmPatternReplacement`(模式替换对)** 子类:pattern 与 replacement 是两个 property 闭包(源码注释说明这是受 bound method tracing 限制的妥协),`get_inputs` 提供示例张量,一组 `empty_bf16`/`empty_fp32` 等静态 helper 把设备绑定到当前平台 `device_type`——平台可插拔(P6)在 pattern 层就生效了。
 
-    @staticmethod
-    def _trace_fn(*args, **kwargs) -> fx.GraphModule:
-        gm = pm.fwd_only(*args, **kwargs)   # 只 trace 前向,忽略 autograd
-        _fx_view_to_reshape(gm)             # view 统一改写成 reshape
-        _remove_noop_permutes(gm)           # 删掉恒等 permute
-        return gm
+**第二件事,如何匹配。** **`VllmFusionPatternMatcherPass`(融合模式匹配 pass 基类)** 的 `register` 在 **`enable_fake_mode`(伪张量模式装饰器)** 下工作:pattern 与 replacement 是"闭包式"的普通 Python 函数,在**没有一张真实张量**的环境里被 trace 成图,示例输入只是形状载体。trace 出的子图还要过 `_trace_fn` 的两步净化——只 trace 前向、view 统一改写成 reshape、删掉恒等 permute(框架另备 `fold_consecutive_reshapes` 折叠 reshape 链)。净化不是修饰而是前提:真实编译图里 view 已被统一为 reshape、恒等 permute 已被删除,pattern 若保持"教科书形态"就永远匹配不上。净化后的两侧交 torch 的 `register_replacement` 建成规则,`__call__` 时 `pm_pass.apply(graph)` 一次性完成全图匹配替换。
+
+**第三件事,命中后如何替换。** 匹配的"词汇表"由 **`MatcherCustomOp`(双模式匹配算子)** 提供:同一个 matcher 对象被 pattern 与 replacement 两侧共用——`forward_native` 产**未融合的 aten 序列**(匹配侧,图里实际出现的形态),`forward_custom` 产**融合后的 custom op 形态**(`_C.*` 算子,经 `auto_functionalized`),构造时按 `enabled` 二选一,而 `enabled` 由算子自己按平台/配置判断(`MatcherQuantFP8` 按 `QuantKey` 查表分发到 `_C.static_scaled_fp8_quant`、`_C.per_token_group_fp8_quant` 等)。匹配侧与替换侧因此**同源**——改一处、两侧同时变。
+
+```mermaid
+flowchart LR
+  classDef vllm fill:#DBEAFE,stroke:#3B82F6,color:#1E3A8A
+  classDef torch fill:#FEF3C7,stroke:#F59E0B,color:#78350F
+  classDef artifact fill:#D1FAE5,stroke:#10B981,color:#064E3B
+
+  A([VllmPatternReplacement 子类<br/>pattern 与 replacement 闭包同源]):::vllm ==> B[register 在 fake mode 下<br/>把两侧各 trace 成 FX 子图]:::vllm
+  B --> C[_trace_fn 净化<br/>view 改 reshape 删恒等 permute]:::vllm
+  C ==> D[torch register_replacement<br/>建成匹配规则]:::torch
+  E{MatcherCustomOp<br/>按平台与配置选 enabled}:::vllm
+  E -- forward_native --> F[pattern 侧<br/>未融合的 aten 序列]:::vllm
+  E -- forward_custom --> G[replacement 侧<br/>融合后 custom op 形态]:::artifact
+  D ==> H[__call__ 时 pm_pass.apply<br/>全图一次性匹配替换]:::vllm
+  H ==> I([match_table 命中统计<br/>log_match_summary 汇总]):::artifact
 ```
 
-**`enable_fake_mode`(伪张量模式装饰器)**(`inductor_pass.py:133-146`)用 `tracing(None)` + `unset_fake_temporarily()` + `FakeTensorMode()` 包住注册过程——pattern 与 replacement 是"闭包式"的普通 Python 函数,在**没有一张真实张量**的环境里被 trace 成图,示例输入只是形状载体。`_trace_fn` 的两步净化很关键:真实编译图里 view 已被统一为 reshape、恒等 permute 已被删除,pattern 若保持"教科书形态"就永远匹配不上(框架另备 `fold_consecutive_reshapes`,`:258-282`,折叠 `reshape(a,b).reshape(c,d)` 链)。
-
-匹配的"词汇表"由 **`MatcherCustomOp`(双模式匹配算子)**(`matcher_utils.py:52-83`)提供:构造时 `self.forward = self.forward_custom if enabled else self.forward_native`(`:59`)。`forward_custom` 产**融合后的 custom op 形态**(`_C.*` 算子,经 `auto_functionalized`),`forward_native` 产**未融合的 aten 序列**。同一个 matcher 对象被 pattern 与 replacement 两侧共用——匹配侧(图里实际出现的形态)与替换侧(融合形态)同源,不会两处手写各自漂移;而 `enabled` 由算子自己按平台/配置判断(`MatcherQuantFP8`,`:307`,按 `QuantKey` 查表分发到 `_C.static_scaled_fp8_quant`、`_C.per_token_group_fp8_quant` 等;`MatcherSiluAndMul`,`:458`)。框架的可观测性同样齐备:`match_table` 是类级 `defaultdict(int)`(`vllm_inductor_pass.py:104`),`__call__` 累加(`:335`),`log_match_summary`(`:120-123`)在管理器末尾汇总,`get_match_table`(`:90-92`)供外部快照——第 15 章调试直接复用;`dump_patterns`(`:125-190`)在开启 `debug_dump_path` 时用 torch 的 `PatternPrettyPrinter` 把每个 pattern 反向导出成可读的 `patterns.<PassName>.<i>.py`。每个 pass 经 **`time_and_log`(计时与转储装饰器)**(`:60-72`)包装:before/after 各 dump 一次图(`dump_graph` 用 `lazy_format_graph_code`,让 depyf 接管输出)。
+框架的可观测性同样齐备:`match_table` 是类级计数表,`__call__` 逐次累加,`log_match_summary` 在管理器末尾汇总,`get_match_table` 供外部快照——第 15 章调试直接复用;`dump_patterns` 在开启 `debug_dump_path` 时用 torch 的 `PatternPrettyPrinter` 把每个 pattern 反向导出成可读的 `patterns.<PassName>.<i>.py`;每个 pass 经 **`time_and_log`(计时与转储装饰器)** 包装,before/after 各 dump 一次图(让 depyf 接管输出)。这些设施服务于同一件事:融合是否发生、发生在哪,必须可回答(本节锚点均见章末索引)。
 
 ### 10.3.5 fusion 清单速览
 
@@ -210,7 +236,7 @@ flowchart LR
 
 **第三步:前置清障与匹配。** 匹配能否发生,先看图够不够"干净":**`NoOpEliminationPass`(无操作消除 pass)**(`utility/noop_elimination.py:18`)的 docstring 明言 "It is required for RMSNorm-quant fusion to work properly"——`apply_fp8_linear` 会多塞一个 2D 情形下冗余的 reshape,不删掉 pattern 就对不上。该 pass 折叠 reshape 链、删恒等 reshape/slice、化简 slice_scatter,维度比较用 `statically_known_true`(`:124`)以支持 SymInt。随后 `patterns.apply(graph)` 逐模式匹配;命中后还要过 **extra_check(额外校验)** `_rms_input_weight_dtype_match`(`rms_quant_fusion.py:47-60`)——匹配是结构性的,dtype 这类"值级"约束靠回调兜底,防止混合精度下误融合。
 
-**第四步:兜底与收尾。** 没被任何 pattern 命中的 `vllm_ir.rms_norm`(比如某层后接的不是量化而是别的算子),由 `VllmIRLoweringPass` 按第 7 章的方式 dispatch 选实现并内联;两遍 `PostCleanup` 清掉替换留下的死节点;最后 `FixFunctionalization` 的 if/elif 链(`fix_functionalization.py:48-232`)覆盖 `rotary_embedding`、`fused_add_rms_norm` 与其 `_static_fp8_quant` 变体、`rms_norm` 族、`silu_and_mul[_quant]`、`fused_qk_norm_rope`、`fused_rope_*` 等,把命中的 `auto_functionalized` 节点经 `defunctionalize`(`:257`)还原成 in-place 调用、把 getitem 用户直接改接到被写参数;未列入链的算子保持 `auto_functionalized` 形态,交给 Inductor 自带的 reinplacing 兜底——源码注释(`:90-94`)也坦承理想方案是上游的 auto_functionalization_v2(P4 的张力)。至此图交给 Inductor:两个(或三个)memory-bound kernel 合一,归一化结果不再落地显存。这类"custom passes"的实测收益,vLLM 博客给出 SiLU+Quant 融合最高 +8%(Llama-3.1-405B FP8,8×MI300;仅作背景叙事,数字以原文为准)。
+**第四步:兜底与收尾。** 没被任何 pattern 命中的 `vllm_ir.rms_norm`(比如某层后接的不是量化而是别的算子),由 `VllmIRLoweringPass` 按第 7 章的方式 dispatch 选实现并内联;两遍 `PostCleanup` 清掉替换留下的死节点;最后 `FixFunctionalization` 用一条 if/elif 链把命中的融合算子逐个去泛函化——经 `defunctionalize` 还原成 in-place 调用、把 getitem 用户直接改接到被写参数,链上覆盖旋转位置编码、rms_norm 与其量化变体、silu_and_mul、qk_norm_rope、rope 系等(算子全名单见源码索引);未列入链的算子保持 `auto_functionalized` 形态,交给 Inductor 自带的 reinplacing 兜底——源码注释也坦承理想方案是上游的 auto_functionalization_v2(P4 的张力)。至此图交给 Inductor:两个(或三个)memory-bound kernel 合一,归一化结果不再落地显存。这类"custom passes"的实测收益,vLLM 博客给出 SiLU+Quant 融合最高 +8%(Llama-3.1-405B FP8,8×MI300;仅作背景叙事,数字以原文为准)。
 
 ## 10.4 本章小结
 
@@ -230,24 +256,27 @@ flowchart LR
 |---|---|
 | `vllm/compilation/passes/pass_manager.py:91`(`PostGradPassManager`) | 固定序管理器,挂在 post_grad 钩子 |
 | `vllm/compilation/passes/pass_manager.py:98-103`(docstring) | "all passes operate on a functionalized graph" |
-| `vllm/compilation/passes/pass_manager.py:109-141`(`__call__`) | 六拍固定序 + range 门控循环 |
-| `vllm/compilation/passes/pass_manager.py:143-224`(`configure`) | 平台门控导入(`:21-57`)与刻意的 pass 顺序(`:169-183`、`:197-219`) |
+| `vllm/compilation/passes/pass_manager.py:109-141`(`__call__`) | 六拍固定序 + range 门控循环;②③④⑤ 先后理由注释 `:121-122`、`:126-127` |
+| `vllm/compilation/passes/pass_manager.py:143-224`(`configure`) | 平台门控导入(`:21-57`,ROCm/aiter、CUDA、XPU 各自 import 块)与刻意的 pass 顺序(`:169-183`、`:197-219`) |
+| `vllm/compilation/passes/pass_manager.py:221-228` | 四个固定 pass 实例化;用户自定义 pass 经 `add` 追加于 FixFunctionalization 之前(注入约束 `backends.py:955-969`) |
 | `vllm/compilation/passes/pass_manager.py:230-252`(`uuid`) | pass_config hash + 全 pass uuid + str(compile_range) |
 | `vllm/compilation/passes/inductor_pass.py:29-54`(`PassContext`) | compile_range + donated_input_ids 的线程级上下文 |
 | `vllm/compilation/passes/inductor_pass.py:57-97` | `_hash_source_cached`/`hash_source`:sha256(源码) |
 | `vllm/compilation/passes/inductor_pass.py:110-111`(`is_applicable_for_range`) | 默认 True 的区间门控 |
 | `vllm/compilation/passes/inductor_pass.py:133-146`(`enable_fake_mode`) | 无真实张量的 pattern trace |
 | `vllm/compilation/passes/vllm_inductor_pass.py:60-79`(`time_and_log`) | before/after dump + 耗时日志 |
-| `vllm/compilation/passes/vllm_inductor_pass.py:95-190`(`VllmPatternMatcherPass`) | match_table(`:104`)、log_match_summary(`:120`)、dump_patterns(`:125`) |
+| `vllm/compilation/passes/vllm_inductor_pass.py:95-190`(`VllmPatternMatcherPass`) | get_match_table(`:90-92`)、match_table(`:104`)、log_match_summary(`:120`)、dump_patterns(`:125`) |
 | `vllm/compilation/passes/vllm_inductor_pass.py:197-249`(`VllmPatternReplacement`) | pattern/replacement 闭包 + 平台绑定 helpers |
-| `vllm/compilation/passes/vllm_inductor_pass.py:296-335`(`VllmFusionPatternMatcherPass`) | register(`:308`)、uuid(`:319`)、_trace_fn(`:325`)、__call__(`:332`) |
+| `vllm/compilation/passes/vllm_inductor_pass.py:258-282`(`fold_consecutive_reshapes`) | 折叠 reshape(a,b).reshape(c,d) 链 |
+| `vllm/compilation/passes/vllm_inductor_pass.py:296-335`(`VllmFusionPatternMatcherPass`) | register(`:308-317`)、uuid(`:319`)、_trace_fn(`:325-330`,fwd_only + view 改 reshape + 删恒等 permute)、__call__(`:332-335`) |
 | `vllm/compilation/passes/fusion/rms_quant_fusion.py:613-671`(`RMSNormQuantFusionPass`) | 注册网格:ε × group × col_major × e8m0 × tma_aligned |
 | `vllm/compilation/passes/fusion/rms_quant_fusion.py:395`(`RMSNormGroupQuantPattern`) | 本章主例(pattern `:423-449`) |
 | `vllm/compilation/passes/fusion/rms_quant_fusion.py:47-60` | extra_check dtype 匹配 |
 | `vllm/compilation/passes/fusion/matcher_utils.py:52-83`(`MatcherCustomOp`) | 双模式:`:59` 按 enabled 选 forward |
+| `vllm/compilation/passes/fusion/matcher_utils.py:307`/`:458` | `MatcherQuantFP8` 按 QuantKey 查表分发;`MatcherSiluAndMul` 的 enabled 判定 |
 | `vllm/compilation/passes/utility/noop_elimination.py:18`(`NoOpEliminationPass`) | RMSNorm-quant fusion 的前置清障;SymInt 支持(`:124`) |
 | `vllm/compilation/passes/utility/post_cleanup.py:8`(`PostCleanupPass`) | stable_topological_sort + DCE |
-| `vllm/compilation/passes/utility/fix_functionalization.py:19`(`FixFunctionalizationPass`) | 去泛函化;docstring 禁 DCE(`:22-24`);链 `:48-232`;`defunctionalize`(`:257`) |
+| `vllm/compilation/passes/utility/fix_functionalization.py:19`(`FixFunctionalizationPass`) | 去泛函化;docstring 禁 DCE(`:22-24`);链 `:48-232` 覆盖 rotary_embedding、fused_add_rms_norm 与 `_static_fp8_quant` 变体、rms_norm 族、silu_and_mul[_quant]、fused_qk_norm_rope、fused_rope_*;`defunctionalize`(`:257`);auto_functionalization_v2 注释(`:90-94`) |
 | `vllm/compilation/passes/fusion/rope_kvcache_fusion.py:461-465` | `compile_range.end <= max_token_num`(decode 专用) |
 | `vllm/compilation/passes/fusion/sequence_parallelism.py:592-618` | `start >= min_token_num` + 整图断言 |
 | `vllm/compilation/passes/fusion/collective_fusion.py:976-983` | AsyncTPPass 整图断言 |

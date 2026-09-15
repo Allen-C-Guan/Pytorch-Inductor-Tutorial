@@ -2,7 +2,7 @@
 chapter: 6
 part: III
 title: Piecewise 切分:为什么 attention 是图的边界
-status: done
+status: review
 difficulty: ★★★
 depends: [2, 3, 4, 5]
 ---
@@ -21,6 +21,25 @@ VI  收官:   [14 设计哲学] → [15 动手实践]
 ## 6.0 本章俯瞰
 
 第 5 章结束时,流水线手里有了一张图:dynamo 只 trace 一次、丢掉全部 guards,把整个模型压成单张 FX 图。一个很自然的想法随之而来:把这张图整个交给 Inductor 不就行了吗,为什么 vLLM 反其道而行,默认在每一层 decoder 的 attention 处各切一刀,让几十层的模型散成上百段碎片?何况每切一刀,就多出一批子图的输入输出要管理、多一份编译产物要缓存,看起来全是成本。答案预告:attention 同时戴着三顶帽子——它是 Inductor 根本写不出来的手写 kernel、它是每一步内容都在变的动态信息的入口、它还是把几十个同构层隔成可复用单元的天然隔板;这一刀落下之后,"交给编译器的基本单位"与"交给 CUDA Graph 录制的基本单位"恰好对齐到同一位置,后文的逐段编译、逐段捕获、缓存去重才有各自的着力点。本章就把这一刀讲透:在哪里切、按什么规则切、切完的碎片如何在不改动整张图结构的前提下,被逐个偷换成编译产物。
+
+先把本章放进整条编译管线:
+
+```text
+torch.compile(model)
+│
+├─ dynamo 一次捕获 ──▶ 整图 FX(唯一符号维 num_tokens)
+│
+├─ 切分 split_graph ◄== 本章
+│    ├─ should_split:算子名单的字符串匹配
+│    ├─ 线性扫描编号:名单算子前后各一刀,独占一区
+│    ├─ getitem 跟随 / 空抽屉折叠
+│    └─ torch split_module 按分区号表物理落刀
+│         └──▶ submod_0..N(可编译 piece + splitting piece)
+│
+├─ 全量预编译(片段 × range):AOT → pass → Inductor
+├─ 造外壳
+└─ serve 期:查 range 执行
+```
 
 ## 6.1 最小前置知识
 
@@ -44,9 +63,9 @@ VI  收官:   [14 设计哲学] → [15 动手实践]
 
 ### 6.3.1 一刀的输入与输出
 
-> **上游给我**:VllmBackend.__call__ 六步流水线第③步递来的整图 `graph`(单张 FX GraphModule,唯一符号维 num_tokens,来源 `vllm/compilation/backends.py:1179`)→ **我做**:`split_graph` 沿节点线性序扫描,在 `should_split` 命中处开刀 → **产出**:`split_gm`(带 `submod_0..N` 子模块的 GraphModule)与 `piecewise_graphs`(SplitItem 清单),去向 `backends.py:1222` 的 **PiecewiseCompileInterpreter**(逐片段编译解释器)。
+> **上游给我**:VllmBackend.__call__ 六步流水线第③步递来的整图 `graph`(单张 FX GraphModule,唯一符号维 num_tokens)→ **我做**:`split_graph` 沿节点线性序扫描,在 `should_split` 命中处开刀 → **产出**:`split_gm`(带 `submod_0..N` 子模块的 GraphModule)与 `piecewise_graphs`(SplitItem 清单),交给 **PiecewiseCompileInterpreter**(逐片段编译解释器)做后续偷换。
 
-**SplitItem**(切分条目,dataclass,`backends.py:406`)只有四个字段:`submod_name`、`graph_id`、`is_splitting_graph`、`graph`。`is_splitting_graph` 为真的条目就是 attention 所在的 splitting piece,不进 Inductor;其余条目是等待编译的可编译 **piece**(片段),切分实现上挂在 `split_gm` 的 submodule 属性上。另有一条旁路:配置 `use_inductor_graph_partition=True` 时,`backends.py:1173-1177` 把切分表置空、跳过 FX 级预切分,分区改由 Inductor 的 scheduler 在 codegen 期完成(`vllm/compilation/partition_rules.py:41` 的 `inductor_partition_rule_context` 把同一份名单注册进 `torch._inductor.config.custom_should_partition_ops`)——同一刀的两种落法,命题 P6 的一个注脚。本章以下讲默认的 FX 级切分。
+**SplitItem**(切分条目,dataclass,`backends.py:406`)只有四个字段:`submod_name`、`graph_id`、`is_splitting_graph`、`graph`。`is_splitting_graph` 为真的条目就是 attention 所在的 splitting piece,不进 Inductor;其余条目是等待编译的可编译 **piece**(片段),切分实现上挂在 `split_gm` 的 submodule 属性上。另有一条旁路:配置 `use_inductor_graph_partition=True` 时把切分表置空、跳过 FX 级预切分,分区改由 Inductor 的 scheduler 在 codegen 期完成——`inductor_partition_rule_context` 把同一份切分名单注册进 `torch._inductor.config.custom_should_partition_ops`,同一刀的两种落法,命题 P6 的一个注脚(两个入口见章末索引)。本章以下讲默认的 FX 级切分。
 
 ```mermaid
 flowchart LR
@@ -66,6 +85,8 @@ flowchart LR
     OUT ==> NEXT[PiecewiseCompileInterpreter<br/>把可编译 piece 偷换成编译产物]:::vllm
     NEXT -.-> SERVE([serve 期 查表调用 各 piece]):::vllm
 ```
+
+这一节只回答"一刀的输入与输出是什么";刀刃在哪里触发、扫描器如何编号、剪刀如何落下,交给下面三节——先看判定函数 `should_split` 的匹配语义。
 
 ### 6.3.2 should_split:一张字符串名单的匹配语义
 
@@ -93,66 +114,83 @@ flowchart LR
 
 > **上游给我**:整图 `graph` 与切分表(同上)→ **我做**:先解引用 size,再线性扫描编号、合并异常分区,最后调用 torch 的 `split_module` 真正落刀 → **产出**:`(split_gm, piecewise_graphs)`(`backends.py:627` 返回)。
 
-**① `_decompose_size_nodes`:先拆 `torch.Size`。** dynamo 把 `x.size()`(无参调用)捕获为 `call_method` target="size" 的节点,它返回一个 `torch.Size` 元组。源码注释说得直白(`backends.py:482-483`):"torch.Size objects cannot cross split boundaries because aot_autograd cannot handle them as submodule outputs"——每个片段要各自过 AOTAutograd,元组无法作为子模块输出跨边界。于是 `_decompose_size_nodes`(`backends.py:479`)借 `tensor_node.meta["example_value"]` 逐维检查:动态维(SymInt)改写为新的 `aten.sym_size.int` 节点,静态维(普通 int)直接内联为字面量;下游若是对 size 取下标(`operator.getitem`),直接换成对应那一维的结果,若是整元组消费(如 `view(x, size)`),则把参数展开成逐维传入(`:525-549`)。
+先立总纲:**六步之中,只有第⑤步真正动刀**。①净化材料、②③画切线、④修正切线,全是纸面作业——图的节点与连接自始至终一根未动;⑤才调用 torch 自带的通用剪刀 `split_module` 物理切开,而 vLLM 递过去的只有一张"节点→分区号"的查询表,**切在哪里(本算法的决策)与怎样切(torch 工具的执行)由此彻底分离**;⑥为切出的碎片开箱记账。后文五段,全是"前四步画切线、第五步下剪刀、第六步开箱单"这一句的展开。
 
-**② 线性扫描编号。** 沿 `graph.graph.nodes` 顺序前进,`placeholder` 与 `output` 跳过;每个节点记入 `node_to_subgraph_id`;`should_split` 命中时 `subgraph_id` 先加一并把该 id 记入 `split_op_graphs`(切分点分区表),随后窥一眼 `node.next`:后继也命中则把 `subgraph_id` 减回来——后继节点自己的"加一"会把它送回同一个 id,**连续 splitting op 合并同区**;否则再加一,开启新区容纳后继节点。
+| 步 | 动作 | 此刻整图处于什么状态 |
+|---|---|---|
+| ① | 拆 `torch.Size` | 仍是一张,材料全部"可跨界" |
+| ②③ | 线性扫描、写分区号 | 仍是一张,每节点多了一个分区号 |
+| ④ | 折掉空分配分区 | 编号修正,不会产出空 piece |
+| ⑤ | `split_module` 落刀 | **物理剪开**,产出 submod_0..N |
+| ⑥ | 收集、按整数排序 | 附加 SplitItem 清单 |
 
-```python
-# vllm/compilation/backends.py:578-591 (v0.27.1)
-        if should_split(node, splitting_ops):
-            subgraph_id += 1
-            node_to_subgraph_id[node] = subgraph_id
-            split_op_graphs.append(subgraph_id)
+**① `_decompose_size_nodes`:拆 `torch.Size`——把"剪不断"的材料换成"剪得断"的。** 片段边界是一道搬运关卡,只收两种形态的货:Tensor 与 SymInt。而 dynamo 会把 `x.size()`(无参调用)捕获为 `call_method` target="size" 的节点,产出一个 `torch.Size` 元组——"整箱货"过不了关。源码注释说得直白(`backends.py:482-483`):"torch.Size objects cannot cross split boundaries because aot_autograd cannot handle them as submodule outputs"——每个片段要各自过 AOTAutograd,元组无法作为子模块输出跨边界。于是 `_decompose_size_nodes`(`backends.py:479`)先行把整箱拆成单件:借 `tensor_node.meta["example_value"]` 逐维检查,动态维(SymInt)改写为新的 `aten.sym_size.int` 节点,静态维(普通 int)直接内联为字面量;下游若对 size 取下标(`operator.getitem`),直接换成对应那一维的结果,若整元组消费(如 `view(x, size)`),则把参数展开成逐维传入(`:525-549`):
 
-            # keep consecutive splitting ops together
-            # (we know node.next exists because node isn't the last (output) node)
-            if should_split(node.next, splitting_ops):
-                # this will get incremented by the next node
-                subgraph_id -= 1
-            else:
-                subgraph_id += 1
-        else:
-            node_to_subgraph_id[node] = subgraph_id
+改写效果对照(以"第 0 维动态、第 1 维静态 4096"的张量为例):
+
+```text
+【示意图】_decompose_size_nodes 改写前后
+改写前:                              改写后:
+  s = x.size()      # Size 元组节点    d0 = sym_size.int(x, 0)  # 动态维 → SymInt 节点
+  h = x.view(s)     # 整元组作参数      h  = view(x, d0, 4096)   # 逐维展开,静态维内联字面量
+  n = s[0]          # 从元组取一维      n  = d0                  # 直接引用那一维
+```
+
+**② 线性扫描编号:画切线,不动刀。** 拿一支笔沿 `graph.graph.nodes` 的线性序走一遍,往每个节点身上写一个分区号(`node_to_subgraph_id`);`placeholder` 与 `output` 跳过。普通节点抄当前的号,笔不动;`should_split` 命中的算子则自己抬一号、独占一区——`subgraph_id` 先加一,该 id 同时记入 `split_op_graphs`(切分点分区表);随后窥一眼 `node.next`:后继也命中则把 `subgraph_id` 减回来——后继节点自己的"加一"会把它送回同一个 id,**连续 splitting op 合并同区**;否则再加一,开启新区容纳后继。
+
+```text
+【伪代码】② 线性扫描编号的核心分支(vllm/compilation/backends.py:578-591)
+对 graph.nodes 线性序逐节点:
+  if should_split(node, splitting_ops):            # 命中切分算子
+      subgraph_id += 1;记 node→新 id;该 id 记入 split_op_graphs
+      if should_split(node.next): subgraph_id -= 1 # 后继也命中 → 抵消,合并同区
+      else:                       subgraph_id += 1 # 否则抬号,开新区容纳后继
+  else:
+      记 node→当前 id                              # 普通节点抄当前的号,笔不动
 ```
 
 为什么必须合并:KV cache 写入(`unified_kv_cache_update`)默认也在切分表里(第 4 章),它通常紧贴在 attention 调用之前;若两个切分算子各占一区,它们之间一个节点都没有,会凭空产生一个空 piece、空子模块、乃至一次空的 cudagraph 捕获。
 
-**③ `operator.getitem` 跟随其输入所在区。** 扫描循环里,`call_function` 且 target 为 `operator.getitem` 的节点被直接赋成其输入(元组生产者)的分区 id(`backends.py:570-576`)。否则,若某个多值算子的 tuple 输出跨界,整只元组都得作为子模块输入传出——这与 standalone_compile 与 AOTAutograd 的输入要求相悖(注释见 `:566-569`);让取下标动作跟随生产者,跨边界流动的就只剩单个张量。
+**③ `operator.getitem` 跟随其输入所在区。** 同一道关卡逻辑的收尾:`call_function` 且 target 为 `operator.getitem` 的节点被直接赋成其输入(元组生产者)的分区 id(`backends.py:570-576`)。否则,若某个多值算子的 tuple 输出跨界,整只元组都得作为子模块输入传出——这与 standalone_compile 与 AOTAutograd 的输入要求相悖(注释见 `:566-569`);让取下标动作跟随生产者,跨边界流动的就只剩单个张量。
 
-**④ `_merge_empty_only_subgraphs`:折掉"只含空分配"的分区。** 有些分区里唯一的节点是一次 `torch.empty`/`new_empty`(判定见 `_is_empty_allocation_node`,`backends.py:414`)。`_merge_empty_only_subgraphs`(`backends.py:437`)把这种分区折入前面最近的非切分分区,docstring 写明动机:"avoid generating standalone empty submodules, which can lead to empty cudagraph captures"。折入有安全检查(`:465-473`):该分配节点的每个输入,要么是图的 placeholder,要么产自分区号不大于目标分区的节点——即**移动之后,分配不会越过它任何输入的生产者**;不满足就放弃合并。
+**④ `_merge_empty_only_subgraphs`:折掉空抽屉。** 有些分区里唯一的节点是一次 `torch.empty`/`new_empty`(判定见 `_is_empty_allocation_node`,`backends.py:414`)——这种"空抽屉"若真切出来,只会得到空 piece、空子模块,乃至一次空的 cudagraph 捕获。`_merge_empty_only_subgraphs`(`backends.py:437`)把它折入前面最近的非切分分区,docstring 写明动机:"avoid generating standalone empty submodules, which can lead to empty cudagraph captures"。折入有安全检查(`:465-473`):该分配节点的每个输入,要么是图的 placeholder,要么产自分区号不大于目标分区的节点——即**移动之后,分配不会越过它任何输入的生产者**;不满足就放弃合并。
 
-**⑤ 真正落刀:`torch.fx.passes.split_module.split_module`(FX 切分工具)。** 上游的通用工具,分区函数就是查表 `lambda node: node_to_subgraph_id[node]`(`backends.py:602-608`)。两个承重参数:`keep_original_order=True`——源码注释(`:595-598`)警告否则 pytorch 可能重排节点、"the semantics of the graph will change when we have mutations in the graph",而 vLLM 的图必然含 mutation(attention 写 output、KV 写 cache);`tuple_return=True`(torch≥2.12 才传入,`:600-601`)让子模块以元组返回多值。外层再包 `_use_lazy_graph_module(True)`(`:599`)纯为提速。分区 id 只是中间记号,`split_module` 按实际产出的子模块重编为 `submod_0..N`。
+**⑤ 真正落刀:`torch.fx.passes.split_module.split_module`(FX 切分工具)。** 剪刀是 torch 的,vLLM 只递切线——分区函数就是查表 `lambda node: node_to_subgraph_id[node]`(`backends.py:602-608`)。两个承重参数:`keep_original_order=True`——源码注释(`:595-598`)警告否则 pytorch 可能重排节点、"the semantics of the graph will change when we have mutations in the graph",而 vLLM 的图必然含 mutation(attention 写 output、KV 写 cache);`tuple_return=True`(torch≥2.12 才传入,`:600-601`)让子模块以元组返回多值。外层再包 `_use_lazy_graph_module(True)`(`:599`)纯为提速。分区 id 只是中间记号,`split_module` 按实际产出的子模块重编为 `submod_0..N`;外层图同步退化为只剩一串 call_module 的"调度壳"(2 层例子的预演,节点级编号推演见 6.3.5):
 
-**⑥ 收集排序。** 遍历 `split_gm.named_modules()`,跳过根模块与嵌套子模块,`graph_id` 取自 `int(name.replace("submod_", ""))`,`is_splitting_graph` 判断该 id 是否在 `split_op_graphs` 里,构造 SplitItem;最后**按整数排序**而非字符串排序(`backends.py:610-625`,否则 `submod_10` 会排在 `submod_2` 之前)。
+```text
+【示意图】split_gm:外层图退化为"调度壳",只剩一串 call_module
+ ├─ submod_0  [rms qkv rope]                     可编译 piece
+ ├─ submod_1  [★attention 与 KV 写入]            splitting piece(不进 Inductor)
+ ├─ submod_2  [o_proj…add + 次层 rms qkv rope]   可编译 piece(跨层粘连,机制见 6.3.5)
+ ├─ submod_3  [★attention]                       splitting piece
+ └─ submod_4  [o_proj…add]                       可编译 piece
+```
+
+**⑥ 收集排序:开箱单。** 遍历 `split_gm.named_modules()`,跳过根模块与嵌套子模块,`graph_id` 取自 `int(name.replace("submod_", ""))`,`is_splitting_graph` 判断该 id 是否在 `split_op_graphs` 里,构造 SplitItem;最后**按整数排序**而非字符串排序(`backends.py:610-625`,否则 `submod_10` 会排在 `submod_2` 之前)。两份产物的分工至此清晰:`split_gm` 留在原地当调度链(外层 call_module 的顺序一根未动),`piecewise_graphs` 则是交给 6.3.4 的装箱单——`is_splitting_graph` 标明哪几件留在源码执行,其余条目等待被偷换成编译产物。
 
 ### 6.3.4 PiecewiseCompileInterpreter:图还是那张图,节点已被偷换
 
-> **上游给我**:`split_gm`(带 submod_N 子模块,`backends.py:1179`)、`submod_names_to_compile`(只含非 splitting 子图名的清单,`backends.py:1202-1206`)与 `fake_args`(把每个真实输入张量替换为对应 placeholder 的 `example_value`,纯 fake 世界零真实计算,`backends.py:1208-1216`)→ **我做**:以 fx.Interpreter 逐节点跑一遍 fake 前向,在每个待编译子模块处构造 PiecewiseBackend 并全量预编译 → **产出**:编译产物替换 `split_gm` 的 submodule 属性(`backends.py:766`),供第⑤步 generate_execution_code 直接引用。
+> **上游给我**:`split_gm`(带 submod_N 子模块)、`submod_names_to_compile`(只含非 splitting 子图名的清单)与 `fake_args`(把每个真实输入张量替换为对应 placeholder 的 `example_value`,纯 fake 世界零真实计算)→ **我做**:以 fx.Interpreter 逐节点跑一遍 fake 前向,在每个待编译子模块处构造 PiecewiseBackend 并全量预编译 → **产出**:编译产物替换 `split_gm` 的 submodule 属性,供第⑤步 generate_execution_code 直接引用。
 
-为什么用 **PiecewiseCompileInterpreter**(`backends.py:687`,改造自 `torch.fx.passes.shape_prop.ShapeProp`)而不是静态遍历?因为每个片段被编译时必须知道自己的输入实参是什么——哪些位置是张量、哪些位置是 SymInt、顺序如何。这只能靠让 fake 值沿图**真实流动**才能在每个 `call_module` 处拿到;静态遍历拿不到"运行到这一步时实参长什么样"。`call_module`(`backends.py:730`)并不真正执行子模块,输出直接取自输出节点的 `node.meta["example_value"]`(`:739-740`):
+为什么用 **PiecewiseCompileInterpreter**(改造自 `torch.fx.passes.shape_prop.ShapeProp`)而不是静态遍历?因为每个片段被编译时必须知道自己的输入实参是什么——哪些位置是张量、哪些位置是 SymInt、顺序如何。这只能靠让 fake 值沿图**真实流动**才能在每个 `call_module` 处拿到;静态遍历拿不到"运行到这一步时实参长什么样"。`call_module` 并不真正执行子模块——输出直接取自输出节点的 `node.meta["example_value"]`,待编译子模块则在此处被就地偷换,核心八行:
 
 ```python
 # vllm/compilation/backends.py:742-772 (v0.27.1,节选)
         if target in self.compile_submod_names:
-            index = self.compile_submod_names.index(target)
             submod = self.fetch_attr(target)
-            sym_shape_indices = [
-                i for i, x in enumerate(args) if isinstance(x, torch.SymInt)
-            ]
-            piecewise_backend = PiecewiseBackend(
-                submod, self.vllm_config, index,
-                len(self.compile_submod_names), sym_shape_indices,
-                self.vllm_backend, graph_returns_tuple(submod),
-                submod_name=target)
-            # __dict__ 优先于 _modules:getattr 从此拿到编译产物
+            sym_shape_indices = [i for i, x in enumerate(args)  # 输入里 SymInt 的位置
+                                 if isinstance(x, torch.SymInt)]
+            piecewise_backend = PiecewiseBackend(submod, self.vllm_config, index,
+                                                 ..., sym_shape_indices, ...)
             self.module.__dict__[target] = wrap_with_cudagraph_if_needed(
-                piecewise_backend, self.vllm_config, self.compilation_config,
-                piecewise_backend.is_first_graph, piecewise_backend.is_last_graph)
+                piecewise_backend, ...)  # 偷换:getattr 从此拿到编译产物
 ```
 
-三处要害。其一,`sym_shape_indices`(`:746-748`)记下该片段输入里所有 SymInt 的位置——正是 num_tokens 这个唯一符号维进入每个片段的口子,交给 **PiecewiseBackend**(片段后端,`vllm/compilation/piecewise_backend.py:86`)做逐 range 编译(第 9 章展开);其构造函数把所有 range 一次编完,这是「启动期编完一切」这条全书不变量在片段层的执行。其二,`index` 与总数决定 `is_first_graph`/`is_last_graph`(`piecewise_backend.py:131-132`),docstring(`backends.py:693-696`)说明清单顺序承重:首图负责日志,末图有特殊的 cudagraph 输出处理。其三,也是本节标题的那句话:`self.module.__dict__[target] = ...`(`:766`)——FX 的属性查找先查 `__dict__` 再回退 `_modules`(源码注释 `backends.py:1280-1282`),于是在不改动 `split_gm` 任何节点与调用顺序的前提下,`getattr(split_gm, "submod_2")` 拿到的已经是包装好的编译产物。后续的序列化也有对应安排:`VLLM_USE_MEGA_AOT_ARTIFACT` 开启时,`backends.py:1181-1185` 在解释器动手之前 deepcopy 一份"还没被偷换"的 split_gm 专供落盘。
+三处要害。其一,`sym_shape_indices` 记下该片段输入里所有 SymInt 的位置——正是 num_tokens 这个唯一符号维进入每个片段的口子,交给 **PiecewiseBackend**(片段后端)做逐 range 编译(第 9 章展开);其构造函数把所有 range 一次编完,这是"启动期编完一切"这条全书不变量在片段层的执行。其二,`index` 与总数决定 `is_first_graph`/`is_last_graph`,docstring 说明清单顺序承重:首图负责日志,末图有特殊的 cudagraph 输出处理。其三,也是本节标题的那句话:`self.module.__dict__[target] = ...`——FX 的属性查找先查 `__dict__` 再回退 `_modules`,于是在不改动 `split_gm` 任何节点与调用顺序的前提下,`getattr(split_gm, "submod_2")` 拿到的已经是包装好的编译产物;这条查找规则正是第⑤步 generate_execution_code 取产物的接缝。后续的序列化也有对应安排:`VLLM_USE_MEGA_AOT_ARTIFACT` 开启时,解释器动手之前会先 deepcopy 一份"还没被偷换"的 split_gm 专供落盘(以上锚点均见章末索引)。
 
-构造完成后顺手过一道 **`wrap_with_cudagraph_if_needed`**(`backends.py:633-684`):没有 piecewise cudagraph、或走 Inductor 分区旁路时原样返回(`:655-659`);否则用 `current_platform.get_static_graph_wrapper_cls()` 解析平台相关的静态图包装类,以 `runtime_mode=PIECEWISE`、`debug_log_enable=首图`、`gc_disable=非首图`、`weak_ref_output=末图` 的选项包上(`:675-683`)——可编译片段从此同时是"编译单元"与"捕获单元",编译期捕获选项在此时此刻一次性定死。
+构造完成后顺手过一道 **`wrap_with_cudagraph_if_needed`**:没有 piecewise cudagraph、或走 Inductor 分区旁路时原样返回;否则用 `current_platform.get_static_graph_wrapper_cls()` 解析平台相关的静态图包装类,以 `runtime_mode=PIECEWISE`、`debug_log_enable=首图`、`gc_disable=非首图`、`weak_ref_output=末图` 的选项包上——可编译片段从此同时是"编译单元"与"捕获单元",编译期捕获选项在此时此刻一次性定死。
+
+**交给下一节什么**:一个每个可编译子模块都已被偷换成编译产物、splitting piece 原封不动的 `split_gm`——这刀切出来的碎片各自吃哪些输入、吐哪些输出,6.3.5 用 2 层 Llama 手推一遍。
 
 ### 6.3.5 手推示例:2 层 LlamaDecoderLayer
 
@@ -192,6 +230,7 @@ L1 o_proj add rms gate_up silu down add      4    submod_4  可编译
 
 - 切分三理由:手写 kernel、动态元数据、缓存粒度。(P3、P1)
 - 匹配语义只认 call_function 的算子全名字符串。(P5)
+- 六步一刀:改写、编号、折空区皆是纸面作业,split_module 唯一落剪;产出双份——split_gm 调度链与 SplitItem 清单。
 - 连续切分算子合并同区,空分配分区向前折。(P2)
 - interpreter 靠 fake 值真实流动重建各片输入输出。(P2)
 - 偷换 __dict__ 属性:图不动,子模块已是编译产物。(P1)
@@ -211,10 +250,12 @@ L1 o_proj add rms gate_up silu down add      4    submod_4  可编译
 | `vllm/compilation/backends.py:578-591` | should_split 命中抬 id;连续切分算子合并(:585-587) |
 | `vllm/compilation/backends.py:599-608`(`split_module` 调用) | keep_original_order=True 承重;tuple_return;lazy graph module |
 | `vllm/compilation/backends.py:610-625` | 收集 submod_N,按整数 graph_id 排序 |
-| `vllm/compilation/backends.py:633`(`wrap_with_cudagraph_if_needed`) | 平台静态图包装类,PIECEWISE 模式与首末图选项 :675-683 |
+| `vllm/compilation/backends.py:633`(`wrap_with_cudagraph_if_needed`) | 平台静态图包装类;旁路原样返回 :655-659;PIECEWISE 模式与首末图选项 :675-683 |
 | `vllm/compilation/backends.py:687`(`PiecewiseCompileInterpreter`) | 改造自 ShapeProp;清单顺序承重 :693-696 |
 | `vllm/compilation/backends.py:730`(`call_module`) | fake 输出 :739-740;sym_shape_indices :746-748;偷换 :766 |
 | `vllm/compilation/backends.py:1173-1179` | use_inductor_graph_partition 分流;split_graph 调用点 |
+| `vllm/compilation/backends.py:1181-1185` | `VLLM_USE_MEGA_AOT_ARTIFACT`:偷换前 deepcopy 一份干净 split_gm 供落盘 |
+| `vllm/compilation/backends.py:1222` | `PiecewiseCompileInterpreter.run` 逐片段构造的调用点 |
 | `vllm/compilation/backends.py:1202-1216` | submod_names_to_compile 只含非 splitting;fake_args 构造 |
 | `vllm/compilation/backends.py:1280-1286` | "__dict__ 优先于 _modules"注释(generate_execution_code 取产物) |
 | `vllm/compilation/partition_rules.py:14`(`should_split`) | 只认 call_function;OpOverloadPacket/OpOverload 两种全名匹配 |

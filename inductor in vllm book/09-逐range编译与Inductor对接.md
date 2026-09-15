@@ -2,7 +2,7 @@
 chapter: 9
 part: IV
 title: 逐 range 编译:PiecewiseBackend 与 Inductor 的对接
-status: done
+status: review
 difficulty: ★★★★★
 depends: [3, 4, 6, 8]
 ---
@@ -21,6 +21,27 @@ VI  收官:   [14 设计哲学] → [15 动手实践]
 ## 9.0 本章俯瞰
 
 第 6 章结尾,每个可编译片段都被偷换成了一个「片段后端」对象,当时只承诺它会编译,没有说怎么编。本章把镜头推到最近:每个片段的图里,除了一个随每步批大小变化的维度之外,一切形状都已定死。这个唯一的变量把编译器逼进两难——按固定大小编,形状可以写死进生成的 kernel,调优器还能针对这一个形状穷举出最好的配置,但服务期的批大小千姿百态,不可能每个都编一份;按可变大小编,一份产物什么批都能吃,却要在每个 kernel 里背着运行时的边界计算与掩码,更无法针对性调优。vLLM 的答案是两套策略并用:把少数高频尺寸各编一份形状写死的产物,把其余所有可能收进少数几个区间、每个区间编一份符号产物,启动时全部编完,运行时按到来批的大小查表取用——第 3 章五层全景里的第四层(L4)由此合拢。但这套「一个片段编多份」的做法,与上游 Inductor「一次 trace 配一次编译」的隐含假设正面冲突:缓存查找、缓存 key 的计算、fake tensor 的一致性检查,全都假设编译发生在 dynamo 的上下文之内。本章后半部分就是这场冲突的完整清单,以及 vLLM 垫在中间的适配层——一叠每一条都有存在理由的运行时补丁,和一个正在把补丁偿还成「正门」的上游新入口。
+
+先把本章放进整条编译管线:
+
+```text
+torch.compile(model)
+│
+├─ dynamo 一次捕获 ─▶ 整图 FX(唯一符号维 num_tokens)
+├─ 切分 ─▶ submod_0..N
+│
+├─ 全量预编译 ◄== 本章
+│    for 片段 in 可编译段:
+│      for range in [尺寸点…, 区间…]:
+│        └─ compile_fx(这个片段, 这个 range)
+│             ├─ AOTAutograd(泛函化 + shape 参数化)
+│             ├─ pass 流水线
+│             └─ Inductor lowering/codegen ─▶ kernel
+│        产物登记进该片段的 range_entries[range]
+│
+├─ 造外壳
+└─ serve 期:PiecewiseBackend 按 num_tokens 查 range 取产物
+```
 
 ## 9.1 最小前置知识
 
@@ -44,9 +65,9 @@ VI  收官:   [14 设计哲学] → [15 动手实践]
 
 ### 9.3.1 两张表长成一本 range_entries 字典
 
-> **上游给我**:定稿的 compilation_config(compile_sizes 与 compile_ranges_endpoints,`vllm/config/compilation.py:575`/`:580`)→ **我做**:`PiecewiseBackend.__init__` 把两表折进统一字典(`piecewise_backend.py:137-184`)→ **产出**:`range_entries: dict[Range, RangeEntry]`,键为 **Range**(尺寸区间,双闭区间,`vllm/config/utils.py:387`),值为 **RangeEntry**(区间条目,`:80`,携带 compile_range、compiled、runnable 三字段)。
+> **上游给我**:定稿的 compilation_config(compile_sizes 与 compile_ranges_endpoints 两张表)→ **我做**:`PiecewiseBackend.__init__` 把两表折进统一字典 → **产出**:`range_entries: dict[Range, RangeEntry]`,键为 **Range**(尺寸区间,双闭区间),值为 **RangeEntry**(区间条目,携带 compile_range、compiled、runnable 三字段)。
 
-区间侧,`get_compile_ranges`(`vllm/config/compilation.py:1565`)把端点表折成 `[1, e0]、[e0+1, e1]、…、[e_{last-1}+1, e_last]`——端点表由 `VllmConfig._set_compile_ranges`(`vllm/config/vllm.py:1945`)计算生成,其中必含调度上限 `max_num_batched_tokens`(`:1953-1955`),因此折出的区间无缝覆盖从 1 到调度上限的每一个整数。尺寸侧,每个整数 n 折成 `Range(n, n)`(`:174-179`);字符串 `"cudagraph_capture_sizes"` 在 `:167-172` 被显式拒绝——它本应在配置解析期的 `post_init_cudagraph_sizes`(`vllm/config/compilation.py:1106-1131`)展开成捕获桶整数,走到编译期还见到字符串说明配置管线断裂,不如当场报错。这个函数还顺带把 None 归一成空表,保证 PiecewiseBackend 拿到的永远是 list:默认(用户未配置)compile_sizes 为空,只有区间产物;要给捕获桶各编一份静态产物,须显式写字面量。两个特例:encoder 编译把末区间的 end 拉到 `2**31-1`(`:138-149`,帧数不受 max_num_batched_tokens 约束);构造参数 graph 与 compiled_runnables 恰提供一个(`:118-120` 断言),对应 9.2 说的互斥两模式。
+两张表是两本不同的账:compile_sizes 记"哪些尺寸值得单独编一份全静态产物",compile_ranges_endpoints 记"其余尺寸如何分区兜底"。折账的规则只有三条。其一,区间侧由端点表折成首尾相接的双闭区间——首段从 1 起,此后每段从前一段端点加一开始;端点表由 VllmConfig 按调度上限计算生成、必含 `max_num_batched_tokens`,因此折出的区间无缝覆盖从 1 到调度上限的每一个整数,一个不漏。其二,尺寸侧每个整数 n 折成单点区间 `Range(n, n)`;字符串字面量 `"cudagraph_capture_sizes"` 在此处被显式拒绝——它本应在配置解析期就展开成捕获桶整数,走到编译期还见到字符串说明配置管线断裂,不如当场报错;None 则归一成空表,保证拿到的一律是 list,默认(用户未配置)compile_sizes 为空、只有区间产物,要给捕获桶各编一份静态产物须显式写字面量。其三,两个特例:encoder 编译把末区间的 end 拉到 `2**31-1`(帧数不受 max_num_batched_tokens 约束);构造参数 graph 与 compiled_runnables 恰提供一个(断言),对应 9.2 说的互斥两模式。动机一言以蔽之:**运行时查表的前提是表覆盖一切可能**,折账规则就是这份"覆盖性"的编译期保证(折账与特例的锚点均见章末索引)。
 
 ```text
 【示意图】同一片段的两本账(设 max_num_batched_tokens = 8192)
@@ -68,9 +89,9 @@ VI  收官:   [14 设计哲学] → [15 动手实践]
 
 ### 9.3.2 compile_all_ranges:不变量 b 的落地
 
-> **上游给我**:片段 FX 图(来自 interpreter 的构造调用,`backends.py:742-764`)与 range_entries → **我做**:**compile_all_ranges**(`piecewise_backend.py:245-277`)逐条目编译 → **产出**:每个条目一个 runnable,serve 期只被 `__call__` 查表调用(`:358-380`)。
+> **上游给我**:片段 FX 图(来自 interpreter 的构造调用)与 range_entries → **我做**:**compile_all_ranges** 逐条目编译 → **产出**:每个条目一个 runnable,serve 期只被 `__call__` 查表调用。
 
-关键分岔在每个条目的 example inputs 怎么造。单尺寸条目走 **create_concrete_args**(`:37-76`):遍历片段的 placeholder,把每个自由 SymInt 替换成常量 size——`concretize`(`:47-52`)对 SymInt 的符号表达式做代入,表达式中所有自由符号一律绑到 size;张量则用 `as_strided` 重建(`:68-72`)。区间条目走 `get_fake_args_from_graph`(`:26-34`),直接取 placeholder meta 里的 example_value,符号维保持 SymInt。两种输入随后汇入同一次调用:`compiler_manager.compile(self.graph, args_list, self.vllm_backend.inductor_config, …, compile_range=…)`(`:266-275`)——编译的始终是同一张片段图,变的只是输入的 concretize 程度。
+关键分岔在每个条目的 example inputs 怎么造。单尺寸条目走 **create_concrete_args**:遍历片段的 placeholder,把每个自由 SymInt 替换成常量 size——`concretize` 对 SymInt 的符号表达式做代入,表达式中所有自由符号一律绑到 size;张量则用 `as_strided` 逐字段保真重建(见下)。区间条目走 **get_fake_args_from_graph**,直接取 placeholder meta 里的 example_value,符号维保持 SymInt。两种输入随后汇入同一次调用:`compiler_manager.compile(self.graph, args_list, self.vllm_backend.inductor_config, …, compile_range=…)`——编译的始终是同一张片段图,变的只是输入的 concretize 程度(分岔与调用的锚点见章末索引)。
 
 ```python
 # vllm/compilation/piecewise_backend.py:61-75 (v0.27.1)
@@ -93,21 +114,9 @@ VI  收官:   [14 设计哲学] → [15 动手实践]
 
 ### 9.3.3 set_inductor_config:好钢用在刀刃上
 
-> **上游给我**:compile_range 与当前 config 字典 → **我做**:**set_inductor_config**(`vllm/compilation/compiler_interface.py:753-760`)只对单尺寸 range 打开两个搜索开关 → **产出**:current_config 里的 max_autotune 与 coordinate_descent_tuning,去向 `compile_fx` 的 `config_patches` 参数。
+> **上游给我**:compile_range 与当前 config 字典 → **我做**:`set_inductor_config` 只对单尺寸 range 打开两个搜索开关 → **产出**:current_config 里的 max_autotune 与 coordinate_descent_tuning,去向 `compile_fx` 的 `config_patches` 参数。
 
-```python
-# vllm/compilation/compiler_interface.py:753-760 (v0.27.1)
-def set_inductor_config(config: dict[str, Any], compile_range: Range) -> None:
-    if compile_range.is_single_size():
-        # for a specific batch size, tuning triton kernel parameters
-        # can be beneficial
-        config["max_autotune"] = envs.VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE
-        config["coordinate_descent_tuning"] = (
-            envs.VLLM_ENABLE_INDUCTOR_COORDINATE_DESCENT_TUNING
-        )
-```
-
-两个 env(`envs.py:1899-1906`)默认都是 1,所以「调不调优」的真正开关是 range 的形状,而不是环境变量。区间产物不值得调优:同一份 kernel 要服务 `[9, 512]` 的每一个取值,编译期面对的不是单一形状,穷举出的「最优配置」对区间内其他形状可能更糟,只能退回启发式默认。静态产物恰好相反:N 写死后搜索空间小而确定,一次穷举终身复用。看同一片段的 rms_norm 在两种产物里的样子:
+这个函数的全部逻辑一句话说完:当 compile_range 是单尺寸区间时,把 max_autotune 与 coordinate_descent_tuning 两个键写进 current_config,区间条目则什么都不动、保持启发式默认(函数本体见章末索引)。两个开关各有 env 兜底(`envs.py:1899-1906`)但默认全开,所以"调不调优"的真正开关是 range 的形状,而不是环境变量。区间产物不值得调优:同一份 kernel 要服务 `[9, 512]` 的每一个取值,编译期面对的不是单一形状,穷举出的「最优配置」对区间内其他形状可能更糟,只能退回启发式默认。静态产物恰好相反:N 写死后搜索空间小而确定,一次穷举终身复用。看同一片段的 rms_norm 在两种产物里的样子:
 
 ```text
 【示意图】同一 rms_norm kernel 在两种产物中的签名(非真实 dump)
@@ -127,9 +136,9 @@ def set_inductor_config(config: dict[str, Any], compile_range: Range) -> None:
 
 ### 9.3.4 CompilerManager:缓存、去重与编译上下文
 
-> **上游给我**:graph、args_list、inductor_config(即 `vllm_backend.inductor_config`,`backends.py:868` 从 `inductor_compile_config` deepcopy 而来,并已被第②步 `configure_post_pass`(`:934`)注入 pre_grad_custom_pass 与 post_grad_custom_post_pass 两钩子,详见第 8 章)、compile_range、graph_index → **我做**:**CompilerManager**(编译管理器)的 `compile`(`backends.py:263-399`)先查盘上缓存(`:286`),未命中则在 **compile_context**(`:149-161`)里调用适配器 → **产出**:runnable 与 handle,写入 `cache[(compile_range, graph_index, compiler.name)]`(`:370`)并最终落盘 `vllm_compile_cache.py`(详见第 13 章)。
+> **上游给我**:graph、args_list、inductor_config(从用户配置 deepcopy 而来、已被第②步注入 pre_grad 与 post_grad 两钩子的那份 config,详见第 8 章)、compile_range、graph_index → **我做**:**CompilerManager**(编译管理器)的 `compile` 先查盘上缓存,未命中则在 compile_context 里调用适配器 → **产出**:runnable 与 handle,写入以 (compile_range, graph_index, compiler) 为键的缓存表,并最终落盘 `vllm_compile_cache.py`(详见第 13 章)。
 
-compile_context 干两件事:`pass_context(compile_range)`(`vllm/compilation/passes/inductor_pass.py:44`)把当前 range 装进模块级 PassContext,`use_inductor_graph_partition` 开启时再叠一层 `inductor_partition_rule_context`。于是**同一个片段在不同 range 下可以走到不同的 pass 集与不同的缓存 key**——range 与 pass 的联动在此埋点,展开见第 10 章。另一个编译期优化是内存去重:patch 掉 `autograd_cache_key`(`:328-350`)偷取 cache key,若该 key 已在 `loaded_artifacts` 里,抛 **StopCompiling** 提前退出、直接复用内存中的既有产物(`:360-362`)——同构片段(名字不同、结构相同,`autograd_cache_normalize_inputs=True` 把它们归一)免掉整段磁盘 IO,这是第 6 章「3 类唯一子图」承诺的兑现处之一。
+compile_context 干两件事:`pass_context(compile_range)`(`vllm/compilation/passes/inductor_pass.py:44`)把当前 range 装进模块级 PassContext,`use_inductor_graph_partition` 开启时再叠一层 `inductor_partition_rule_context`。于是**同一个片段在不同 range 下可以走到不同的 pass 集与不同的缓存 key**——range 与 pass 的联动在此埋点,展开见第 10 章。另一个编译期优化是内存去重:patch 掉 `autograd_cache_key` 偷取 cache key,若该 key 已在 `loaded_artifacts` 里,抛 **StopCompiling** 提前退出、直接复用内存中的既有产物——同构片段(名字不同、结构相同,`autograd_cache_normalize_inputs=True` 把它们归一)免掉整段磁盘 IO,这是第 6 章「3 类唯一子图」承诺的兑现处之一(锚点见章末索引)。
 
 ### 9.3.5 选哪个适配器:make_compiler
 
@@ -137,7 +146,7 @@ compile_context 干两件事:`pass_context(compile_range)`(`vllm/compilation/pas
 
 ### 9.3.6 InductorAdaptor:一叠每条都必须存在的补丁
 
-> **上游给我**:graph(片段 FX 图)、example_inputs(静态或符号)、current_config → **我做**:`InductorAdaptor.compile`(`compiler_interface.py:482-658`)以一叠 patch 包住一次 `compile_fx` 调用 → **产出**:compiled artifact 与 handle `(hash_str, file_path)`(`:658`),去向 CompilerManager 的缓存表。
+> **上游给我**:graph(片段 FX 图)、example_inputs(静态或符号)、current_config → **我做**:`InductorAdaptor.compile` 以一叠 patch 包住一次 `compile_fx` 调用 → **产出**:compiled artifact 与 handle `(hash_str, file_path)`,去向 CompilerManager 的缓存表。
 
 对接的主句只有一行:`compile_fx(graph, example_inputs, inner_compile=hijacked_compile_fx_inner, config_patches=current_config)`(`:637-642`)。current_config 就是第 8 章注入两钩子后的 inductor_config——vLLM 的 pass 经 `config_patches` 流进 Inductor,post_grad 钩子在 post-grad 阶段被调用(详见第 10 章)。补丁栈逐条过:
 
@@ -178,34 +187,28 @@ flowchart LR
     ART -.-> SRV([serve 期查表调用]):::vllm
 ```
 
-```python
-# vllm/compilation/compiler_interface.py:606-642 (v0.27.1,节选)
-            stack.enter_context(
-                torch._inductor.config.patch(fx_graph_remote_cache=False)
-            )
-            stack.enter_context(
-                torch._functorch.config.patch(enable_autograd_cache=False)
-            )
-            # ...此处省略 清 tracing_context 与其余 patch...
-            compiled_graph = compile_fx(
-                graph,
-                example_inputs,
-                inner_compile=hijacked_compile_fx_inner,
-                config_patches=current_config,
-            )
+```text
+【伪代码】InductorAdaptor.compile 的对接骨架(vllm/compilation/compiler_interface.py:606-642 之意)
+    with ExitStack() as stack:                    # 一叠 patch 各自入栈,退出自动还原
+        stack.enter_context(patch(fx_graph_remote_cache=False))   # 远程缓存关
+        stack.enter_context(patch(enable_autograd_cache=False))   # autograd 缓存关
+        # ...清 tracing_context 与其余 patch(对应表中 #5-#7)...
+        compiled_graph = compile_fx(graph, example_inputs,
+                                    inner_compile=hijacked_compile_fx_inner,
+                                    config_patches=current_config)  # 对接的主句
 ```
 
 ### 9.3.7 InductorStandaloneAdaptor:正门与偿还
 
-> **上游给我**:同上 → **我做**:**InductorStandaloneAdaptor.compile**(`compiler_interface.py:280-414`)调用 `standalone_compile(graph, example_inputs, dynamic_shapes=…, options={"config_patches": current_config})`(`:375-376`)→ **产出**:compiled artifact 与 handle `(key, path)`,产物 save 到 `cache_dir/key`(`:390-414`)。
+> **上游给我**:同上 → **我做**:**InductorStandaloneAdaptor.compile** 调用 `standalone_compile(graph, example_inputs, dynamic_shapes=…, options={"config_patches": current_config})` → **产出**:compiled artifact 与 handle `(key, path)`,产物 save 到 `cache_dir/key`。
 
-torch≥2.8 可用、`VLLM_USE_STANDALONE_COMPILE` 默认开,因此这是今天的默认路径。**standalone_compile** 本来就是为「脱离 dynamo 使用 Inductor」设计的官方入口:同样的编译,不再需要那叠补丁——缓存 key 自己算、序列化自己管,`load`(`:416-446`)用 `CompiledArtifact.load` 按路径直取。shape 策略映射为 `dynamic_shapes` 参数:单尺寸 range 用 `"from_example_inputs"`(把 example inputs 当静态形状),区间用 `"from_graph"`(从图的 SymInt 推出符号形状)(`:296-299`)。正门之内仍剩两处针对性 patch:其一,torch<2.12 且 `VLLM_ENABLE_PREGRAD_PASSES=0` 时把 `_recursive_pre_grad_passes` 换成恒等(`:330-341`)——Inductor 的 pre-grad pass 对 vLLM 毫无作用,却即使缓存命中也要耗 O(1s),torch 2.12 已修(pytorch#174502);其二,`from_example_inputs` 会新建 FakeTensorMode,与 create_concrete_args 造出的输入 fake 的 mode 不一致触发断言,于是 patch 它复用输入自带的 mode(`:343-373`,pytorch#176562)。另有 torch<2.10 时对 `CompiledArtifact.save` 的原子写回填(pytorch#162432,`:210-248`),防并发编译写坏缓存文件。可见「正门」也非一日建成——补丁数量从七条降到两三条,债在持续偿还。
+torch≥2.8 可用、`VLLM_USE_STANDALONE_COMPILE` 默认开,因此这是今天的默认路径。**standalone_compile** 本来就是为「脱离 dynamo 使用 Inductor」设计的官方入口:同样的编译,不再需要那叠补丁——缓存 key 自己算、序列化自己管,load 用 `CompiledArtifact.load` 按路径直取。shape 策略映射为 `dynamic_shapes` 参数:单尺寸 range 用 `"from_example_inputs"`(把 example inputs 当静态形状),区间用 `"from_graph"`(从图的 SymInt 推出符号形状)。正门之内仍剩两处针对性 patch:其一,torch<2.12 且 `VLLM_ENABLE_PREGRAD_PASSES=0` 时把 `_recursive_pre_grad_passes` 换成恒等——Inductor 的 pre-grad pass 对 vLLM 毫无作用,却即使缓存命中也要耗 O(1s),torch 2.12 已修(pytorch#174502);其二,`from_example_inputs` 会新建 FakeTensorMode,与 create_concrete_args 造出的输入 fake 的 mode 不一致触发断言,于是 patch 它复用输入自带的 mode(pytorch#176562)。另有 torch<2.10 时对 `CompiledArtifact.save` 的原子写回填(pytorch#162432),防并发编译写坏缓存文件。可见「正门」也非一日建成——补丁数量从七条降到两三条,债在持续偿还(以上锚点见章末索引)。
 
 ### 9.3.8 运行时:查表,只有查表
 
-> **上游给我**:serve 期每步的片段实参(符号维位置上是一个具体 int)→ **我做**:`__call__`(`piecewise_backend.py:358-380`)取 `runtime_shape = args[sym_shape_indices[0]]`(`:360`),交 **_find_range_for_shape**(`:343-356`)→ **产出**:`range_entry.runnable(*args)` 的直接调用。
+> **上游给我**:serve 期每步的片段实参(符号维位置上是一个具体 int)→ **我做**:`__call__` 取 `runtime_shape = args[sym_shape_indices[0]]`,交 **_find_range_for_shape** → **产出**:`range_entry.runnable(*args)` 的直接调用。
 
-_find_range_for_shape 先查精确:`runtime_shape in compile_sizes` 命中则取单点条目;否则线性扫 compile_ranges 找包含它的区间;都落空返回 None,由 `__call__` 的断言报错——报错文案直说「out of considered ranges」,即启动期漏编或配置漏配,而非运行时该去现编。输入全静态的片段(sym_shape_indices 为空)则要求恰好一个已编译条目(`:366-373`)。每条路径上的第二条断言(`:375-379`)把不变量 b 变成运行时契约:「所有 range 应在 __init__ 里编完」;更外层,warmup 结束后才激活的 JIT monitor 会把 serve 期任何内核编译变成告警或报错(`vllm/utils/jit_monitor.py:129`)——不变量 d 的守门人。
+_find_range_for_shape 先查精确:`runtime_shape in compile_sizes` 命中则取单点条目;否则线性扫 compile_ranges 找包含它的区间;都落空返回 None,由 `__call__` 的断言报错——报错文案直说「out of considered ranges」,即启动期漏编或配置漏配,而非运行时该去现编。输入全静态的片段(sym_shape_indices 为空)则要求恰好一个已编译条目。每条路径上的第二条断言把不变量 b 变成运行时契约:「所有 range 应在 __init__ 里编完」;更外层,warmup 结束后才激活的 JIT monitor 会把 serve 期任何内核编译变成告警或报错——不变量 d 的守门人。
 
 ```mermaid
 stateDiagram-v2
@@ -226,7 +229,7 @@ stateDiagram-v2
     断言报错 --> [*]
 ```
 
-三个收尾件。**EagerAdaptor**(`:796-810`)返回原图、handle 为 None——不编译,用于把「问题是否由编译引入」从流水线里干净地摘出去(调试详见第 15 章)。**trigger_inductor_lazy_init**(`:768-793`)在 warmup 末尾被调用(`vllm/v1/worker/gpu_worker.py:827-830`,紧跟其后才激活 JIT monitor):Inductor 若干进程级惰性初始化含 CUDA 同步,若 warmup 全程命中盘上缓存、没有真正编译,这些初始化会漏触发、推迟到 serve 期第一次缓存未命中时才炸——主动前置,是「启动期编完一切」的补丁。**to_bytes**(`piecewise_backend.py:209-243`)与 **load_all_ranges**(`:319-341`)服务温启动与 AOT 产物:前者在 `bundled_autograd_cache` 上下文里逐条目 serialize,后者把缓存里的 compiled_runnables 按 `str(Range)` 键包成 wrapper 并一次装载完毕——与 compile_all_ranges 完全对称,机制详见第 13 章。
+三个收尾件。**EagerAdaptor** 返回原图、handle 为 None——不编译,用于把「问题是否由编译引入」从流水线里干净地摘出去(调试详见第 15 章)。**trigger_inductor_lazy_init** 在 warmup 末尾被调用(紧跟其后才激活 JIT monitor):Inductor 若干进程级惰性初始化含 CUDA 同步,若 warmup 全程命中盘上缓存、没有真正编译,这些初始化会漏触发、推迟到 serve 期第一次缓存未命中时才炸——主动前置,是「启动期编完一切」的补丁。**to_bytes** 与 **load_all_ranges** 服务温启动与 AOT 产物:前者在 `bundled_autograd_cache` 上下文里逐条目 serialize,后者把缓存里的 compiled_runnables 按 `str(Range)` 键包成 wrapper 并一次装载完毕——与 compile_all_ranges 完全对称,机制详见第 13 章(三者的锚点见章末索引)。
 
 ## 9.4 本章小结
 
@@ -255,7 +258,8 @@ stateDiagram-v2
 | `vllm/compilation/piecewise_backend.py:343-356`(`_find_range_for_shape`) | 先精确后包含 |
 | `vllm/compilation/piecewise_backend.py:358-380`(`__call__`) | runtime_shape 取自 sym_shape_indices[0];双重断言 |
 | `vllm/compilation/compiler_interface.py:117-156`(`AlwaysHitShapeEnv`) | 永真 shape env;docstring 讲 dynamo 一次/Inductor 多次的裂缝 |
-| `vllm/compilation/compiler_interface.py:251-446`(`InductorStandaloneAdaptor`) | 正门:dynamic_shapes 分岔 :296-299;pre-grad patch :330-341;FakeTensorMode patch :343-373;调用 :375-376 |
+| `vllm/compilation/compiler_interface.py:210-248` | torch<2.10 `CompiledArtifact.save` 原子写回填(pytorch#162432) |
+| `vllm/compilation/compiler_interface.py:251-446`(`InductorStandaloneAdaptor`) | 正门:dynamic_shapes 分岔 :296-299;pre-grad patch :330-341;FakeTensorMode patch :343-373;调用与 save :375-414 |
 | `vllm/compilation/compiler_interface.py:463-480`(`InductorAdaptor.initialize_cache`) | TORCHINDUCTOR/TRITON_CACHE_DIR 重定向进 base_cache_dir |
 | `vllm/compilation/compiler_interface.py:482-658`(`InductorAdaptor.compile`) | 补丁栈与 compile_fx 对接(:637-642);hash 缺失报错 :645-654 |
 | `vllm/compilation/compiler_interface.py:660-727`(`InductorAdaptor.load`) | 凭 hash 直查 FxGraphCache;f(list)->tuple 转 f(*args) |
@@ -264,6 +268,7 @@ stateDiagram-v2
 | `vllm/compilation/compiler_interface.py:796-810`(`EagerAdaptor`) | 返回原图不编译,调试隔离 |
 | `vllm/compilation/backends.py:96`(`make_compiler`) | 适配器选择:standalone 优先,backend 可插拔 |
 | `vllm/compilation/backends.py:149-161`(`compile_context`) | pass_context(compile_range) + 可选分区规则上下文 |
+| `vllm/compilation/backends.py:328-362` | patch `autograd_cache_key` 偷 cache key;命中 `loaded_artifacts` 抛 StopCompiling 内存去重 |
 | `vllm/compilation/backends.py:263-399`(`CompilerManager.compile`) | 盘缓存 → compile_context → 去重 → 落缓存 |
 | `vllm/compilation/passes/inductor_pass.py:44`(`pass_context`) | PassContext 装 compile_range(range 与 pass 联动) |
 | `vllm/config/compilation.py:575`/`:580` | compile_sizes / compile_ranges_endpoints 字段 |

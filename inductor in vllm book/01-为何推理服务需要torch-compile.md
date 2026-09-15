@@ -2,7 +2,7 @@
 chapter: 1
 part: I
 title: 为何推理服务需要 torch.compile:launch-bound 的 decode
-status: done
+status: review
 difficulty: ★★
 depends: []
 ---
@@ -21,6 +21,23 @@ VI  收官:   [14 设计哲学] → [15 动手实践]
 ## 1.0 本章俯瞰
 
 一个看似反直觉的事实是:大模型推理里最难加速、也最值得加速的阶段,恰恰是每步计算量最小的那个阶段。生成回答时,模型像人写字一样一个 token 一个 token 地往外吐,每吐一个 token 就要把几十层网络完整跑一遍。这一步真正花在矩阵乘法上的时间少得可怜——几百个请求凑在一起,单层的输入也不过是几百行向量,GPU 读取权重一遍就把活干完了。可服务延迟偏偏卡在这里,吞吐也卡在这里。为什么计算量最小的阶段反而最慢?答案预告:因为 GPU 在这一步的大部分时间不是在算,而是在等——等 CPU 用 Python 一个算子一个算子地解释、分发、启动;把 CPU 从每步的执行路径上请出去,就是本书要讲的全部机制共同服务的那个目标,而付出的代价(一次性的编译)恰好可以藏进服务启动阶段。
+
+先把本章放进整条推理服务链:
+
+```text
+推理服务(每个 step 循环一次)
+│
+├─ V1 调度器:凑 batch(本 step 共 num_tokens 行)
+│
+├─ 模型 forward ◄== 本章:这一步的成本结构是全书起点
+│    ├─ eager:Python 逐算子调度,launch 开销吃满 host
+│    └─ torch.compile:消灭 host 开销,代价是启动时间与缓存
+│                       ——后续 14 章都在做这笔交易
+│
+├─ 采样 / 输出 token
+│
+└─ KV cache 读写贯穿始终
+```
 
 ## 1.1 最小前置知识
 
@@ -75,20 +92,7 @@ def forward(self, positions, hidden_states, residual):
     return hidden_states, residual
 ```
 
-`self_attn` 与 `mlp` 内部再展开一层:
-
-```python
-# vllm/model_executor/models/llama.py:221-231 (v0.27.1)
-def forward(self, positions, hidden_states):
-    qkv, _ = self.qkv_proj(hidden_states)
-    q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-    q, k = self.rotary_emb(positions, q, k)
-    attn_output = self.attn(q, k, v)
-    output, _ = self.o_proj(attn_output)
-    return output
-```
-
-由此得到每层的 launch 账本(示意图——按源码调用点清点,非 profiler 实测):
+`self_attn` 与 `mlp` 内部各再展开一层(attention 支路 5 个调用点见 `llama.py:221-231`,mlp 支路 3 个见 `llama.py:115-119`,均已列入章末源码索引),由此得到每层的 launch 账本(示意图——按源码调用点清点,非 profiler 实测):
 
 | # | 调用 | 锚点 | 类型 |
 |---|---|---|---|

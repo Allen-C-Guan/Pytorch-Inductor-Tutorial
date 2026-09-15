@@ -160,7 +160,7 @@ difficulty: ★
 | `computation_graph.py` | 计算图转储 | Ch13 | 切分后整图的 print_readable 产物 |
 | `transformed_code.py` | 变换字节码转储 | Ch5 | dynamo 变换后 forward 的 depyf 反编译产物 |
 | depyf | dynamo 反编译工具 | Ch15 | 把 dynamo 内部产物转成可读 Python |
-| tlparse | 时间线解析 | Ch15 | `TORCH_COMPILE_DEBUG=1` 产物的解析查看器 |
+| tlparse | 时间线解析 | Ch15 | `TORCH_TRACE=<dir>` 产物的解析查看器 |
 | match table | 匹配统计表 | Ch15 | `VllmPatternMatcherPass.get_match_table`:各 fusion 命中计数 |
 | `compilation_counter` | 编译计数器 | Ch8 | 全书各编译事件计数的单例,测试与调试用 |
 
