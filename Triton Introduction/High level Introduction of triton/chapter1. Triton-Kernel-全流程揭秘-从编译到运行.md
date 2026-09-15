@@ -241,7 +241,7 @@ def run(self, *args, grid, warmup, **kwargs):
 #### Backend 的注册
 
 
-**当 Triton 被 import 时**，Python 会加载 *riton/init.py*，触发加载 *triton/runtime/init.py*、*triton/runtime/driver.py*、*triton/runtime/driver.py* 以及 *triton/backends/init.py*
+**当 Triton 被 import 时**，Python 会加载 *triton/init.py*，触发加载 *triton/runtime/init.py*、*triton/runtime/driver.py* 以及 *triton/backends/init.py*
 
 
 ```
